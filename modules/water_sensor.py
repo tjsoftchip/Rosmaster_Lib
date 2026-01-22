@@ -56,50 +56,62 @@ class WaterSensor:
         if not self.relay.connected:
             return None
         
-        try:
-            # 构建请求帧
-            data = bytes([
-                (register_addr >> 8) & 0xFF,
-                register_addr & 0xFF,
-                0x00,
-                0x01
-            ])
-            
-            frame = bytes([self.device_id, 0x03]) + data
-            crc = calculate_crc16(frame)
-            frame += bytes([crc & 0xFF, (crc >> 8) & 0xFF])
-            
-            # 发送请求
-            self.relay.ser.write(frame)
-            self.relay.ser.flush()
-            
-            # 读取响应
-            time.sleep(0.01)
-            response = self.relay.ser.read(7)
-            
-            if len(response) != 7:
-                return None
-            
-            # 验证 CRC
-            received_crc = (response[-1] << 8) | response[-2]
-            calculated_crc = calculate_crc16(response[:-2])
-            
-            if received_crc != calculated_crc:
-                if self.debug:
-                    print("[WaterSensor] CRC 校验错误")
-                return None
-            
-            # 解析数据（16位有符号整数）
-            # Modbus RTU 响应格式: 地址 + 功能码 + 字节数 + 数据高位 + 数据低位 + CRC低位 + CRC高位
-            value = (response[3] << 8) | response[4]
-            if value & 0x8000:
-                value = value - 0x10000
+        # 使用锁保护串口访问
+        with self.relay._lock:
+            try:
+                # 构建请求帧
+                data = bytes([
+                    (register_addr >> 8) & 0xFF,
+                    register_addr & 0xFF,
+                    0x00,
+                    0x01
+                ])
+                
+                frame = bytes([self.device_id, 0x03]) + data
+                crc = calculate_crc16(frame)
+                frame += bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+                
+                # 发送请求
+                self.relay.ser.write(frame)
+                self.relay.ser.flush()
+                
+                # 清空缓冲区，避免残留数据
+                self.relay.ser.reset_input_buffer()
+                
+                # 读取响应
+                time.sleep(0.02)
+                response = self.relay.ser.read(7)
+                
+                if len(response) != 7:
+                    if self.debug:
+                        print(f"[WaterSensor] 响应长度不正确: 期望 7 字节, 实际 {len(response)} 字节")
+                    return None
+                
+                # 验证 CRC
+                received_crc = (response[-1] << 8) | response[-2]
+                calculated_crc = calculate_crc16(response[:-2])
+                
+                if received_crc != calculated_crc:
+                    if self.debug:
+                        print("[WaterSensor] CRC 校验错误")
+                    return None
+                
+                # 解析数据（16位有符号整数）
+                # Modbus RTU 响应格式: 地址 + 功能码 + 字节数 + 数据高位 + 数据低位 + CRC低位 + CRC高位
+                value = (response[3] << 8) | response[4]
+                if value & 0x8000:
+                    value = value - 0x10000
 
-            return value
-        except Exception as e:
-            if self.debug:
-                print(f"[WaterSensor] 读取寄存器错误: {e}")
-            return None
+                return value
+            except Exception as e:
+                if self.debug:
+                    print(f"[WaterSensor] 读取寄存器错误: {e}")
+                # 读取失败时清空缓冲区
+                try:
+                    self.relay.ser.reset_input_buffer()
+                except:
+                    pass
+                return None
     
     def _read_holding_register_average(self, register_addr, count=5):
         """
