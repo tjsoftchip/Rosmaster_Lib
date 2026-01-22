@@ -66,24 +66,36 @@ class MSSDController:
         self._connect()
     
     def _connect(self):
-        """连接串口"""
+        """连接串口（检查是否已被占用）"""
+        # 检查串口是否已经被打开
+        if self.ser and self.ser.is_open:
+            if self.debug:
+                print(f"[MSSD] 串口 {self.port} 已经打开，复用现有连接")
+            self.connected = True
+            return
+
         try:
+            # 尝试打开串口
             self.ser = serial.Serial(
                 port=self.port,
                 baudrate=self.baudrate,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
-                timeout=0.1
+                timeout=0.1,
+                exclusive=False  # 允许其他进程访问（同一进程内共享）
             )
             self.connected = True
-            if self.debug:
-                print(f"[MSSD] 串口连接成功: {self.port}")
-                print(f"[MSSD] 设备地址: {self.device_id}, 波特率: {self.baudrate}")
-        except Exception as e:
-            self.connected = False
-            if self.debug:
-                print(f"[MSSD] 串口连接失败: {e}")
+            print(f"[MSSD] ✓ Connected to {self.port} (device_id={self.device_id})")
+        except serial.SerialException as e:
+            # 如果串口已被占用，尝试获取现有的文件描述符
+            if "Permission denied" in str(e) or "could not open port" in str(e):
+                if self.debug:
+                    print(f"[MSSD] 串口 {self.port} 已被占用，尝试查找现有连接...")
+                self.connected = False
+            else:
+                self.connected = False
+                print(f"[MSSD] ✗ Connection failed: {e}")
         
         # MSSD 相关变量
         self.last_command_time = 0  # 上次命令时间
