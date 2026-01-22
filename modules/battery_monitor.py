@@ -54,50 +54,63 @@ class BatteryMonitor:
         if not self.relay.connected:
             return None
         
-        try:
-            # 构建请求帧
-            data = bytes([
-                (register_addr >> 8) & 0xFF,
-                register_addr & 0xFF,
-                (count >> 8) & 0xFF,
-                count & 0xFF
-            ])
-            
-            frame = bytes([self.device_id, 0x04]) + data
-            crc = calculate_crc16(frame)
-            frame += bytes([crc & 0xFF, (crc >> 8) & 0xFF])
-            
-            # 发送请求
-            self.relay.ser.write(frame)
-            self.relay.ser.flush()
-            
-            # 读取响应
-            time.sleep(0.01)
-            response = self.relay.ser.read(5 + count * 2)
-            
-            if len(response) < 5:
-                return None
-            
-            # 验证 CRC
-            received_crc = (response[-1] << 8) | response[-2]
-            calculated_crc = calculate_crc16(response[:-2])
-            
-            if received_crc != calculated_crc:
-                if self.debug:
-                    print("[BatteryMonitor] CRC 校验错误")
-                return None
-            
-            # 解析数据（高字节在前）
-            byte_count = response[2]
-            values = []
-            for i in range(byte_count // 2):
-                value = (response[3 + i * 2] << 8) | response[3 + i * 2 + 1]
-                values.append(value)
+        # 使用锁保护串口访问
+        with self.relay._lock:
+            try:
+                # 构建请求帧
+                data = bytes([
+                    (register_addr >> 8) & 0xFF,
+                    register_addr & 0xFF,
+                    (count >> 8) & 0xFF,
+                    count & 0xFF
+                ])
+                
+                frame = bytes([self.device_id, 0x04]) + data
+                crc = calculate_crc16(frame)
+                frame += bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+                
+                # 发送请求
+                self.relay.ser.write(frame)
+                self.relay.ser.flush()
+                
+                # 清空缓冲区，避免残留数据
+                self.relay.ser.reset_input_buffer()
+                
+                # 读取响应
+                time.sleep(0.02)
+                response = self.relay.ser.read(5 + count * 2)
+                
+                if len(response) < 5:
+                    if self.debug:
+                        print(f"[BatteryMonitor] 响应长度不足: 期望 {5 + count * 2} 字节, 实际 {len(response)} 字节")
+                    return None
+                
+                # 验证 CRC
+                received_crc = (response[-1] << 8) | response[-2]
+                calculated_crc = calculate_crc16(response[:-2])
+                
+                if received_crc != calculated_crc:
+                    if self.debug:
+                        print("[BatteryMonitor] CRC 校验错误")
+                    return None
+                
+                # 解析数据（高字节在前）
+                byte_count = response[2]
+                values = []
+                for i in range(byte_count // 2):
+                    value = (response[3 + i * 2] << 8) | response[3 + i * 2 + 1]
+                    values.append(value)
 
-            return values
-        except Exception as e:
-            if self.debug:
-                print(f"[BatteryMonitor] 读取输入寄存器错误: {e}")
+                return values
+            except Exception as e:
+                if self.debug:
+                    print(f"[BatteryMonitor] 读取输入寄存器错误: {e}")
+                # 读取失败时清空缓冲区
+                try:
+                    self.relay.ser.reset_input_buffer()
+                except:
+                    pass
+                return None
             return None
     
     def _read_input_register_average(self, register_addr, count=1, read_count=5):
