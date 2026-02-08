@@ -73,9 +73,6 @@ class BatteryMonitor:
                 self.relay.ser.write(frame)
                 self.relay.ser.flush()
                 
-                # 清空缓冲区，避免残留数据
-                self.relay.ser.reset_input_buffer()
-                
                 # 读取响应
                 time.sleep(0.02)
                 response = self.relay.ser.read(5 + count * 2)
@@ -83,6 +80,17 @@ class BatteryMonitor:
                 if len(response) < 5:
                     if self.debug:
                         print(f"[BatteryMonitor] 响应长度不足: 期望 {5 + count * 2} 字节, 实际 {len(response)} 字节")
+                    return None
+                
+                # 验证设备 ID 和功能码
+                if response[0] != self.device_id:
+                    if self.debug:
+                        print(f"[BatteryMonitor] 设备 ID 不匹配: 期望 {self.device_id}, 实际 {response[0]}")
+                    return None
+                
+                if response[1] != 0x04:
+                    if self.debug:
+                        print(f"[BatteryMonitor] 功能码不匹配: 期望 0x04, 实际 {response[1]}")
                     return None
                 
                 # 验证 CRC
@@ -105,13 +113,7 @@ class BatteryMonitor:
             except Exception as e:
                 if self.debug:
                     print(f"[BatteryMonitor] 读取输入寄存器错误: {e}")
-                # 读取失败时清空缓冲区
-                try:
-                    self.relay.ser.reset_input_buffer()
-                except:
-                    pass
                 return None
-            return None
     
     def _read_input_register_average(self, register_addr, count=1, read_count=5):
         """

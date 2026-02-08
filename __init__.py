@@ -13,7 +13,15 @@ import os
 
 # 导入新的模块化 Rosmaster 类
 from .core.rosmaster import Rosmaster
+from .core.rosmaster_singleton import (
+    RosmasterSingleton,
+    get_rosmaster,
+    is_rosmaster_initialized,
+    reset_rosmaster
+)
 from .core.constants import *
+from .modules.data_synchronizer import DataSynchronizer
+from .modules.steering_angle_sensor import SteeringAngleSensor
 
 # 车型名称映射（从 constants 导入）
 CAR_TYPE_NAMES = {
@@ -137,8 +145,10 @@ def create_rosmaster(com="/dev/myserial", delay=0.002, debug=False,
 
 # 为了保持向后兼容，导出 Rosmaster 类和所有常量
 __all__ = [
-    'Rosmaster', 'create_rosmaster', 
-    'CARTYPE_X3', 'CARTYPE_X3_PLUS', 'CARTYPE_X1', 
+    'Rosmaster', 'create_rosmaster',
+    'RosmasterSingleton', 'get_rosmaster', 'is_rosmaster_initialized', 'reset_rosmaster',
+    'CARTYPE_X3', 'CARTYPE_X3_PLUS', 'CARTYPE_X1',
     'CARTYPE_R2', 'CARTYPE_R2_MSSD',
-    'CAR_TYPE_NAMES', 'get_car_type_from_env'
+    'CAR_TYPE_NAMES', 'get_car_type_from_env',
+    'DataSynchronizer', 'SteeringAngleSensor'
 ]

@@ -12,11 +12,15 @@ from .mssd_controller import MSSDController
 from .relay_controller import RelayController
 from .water_sensor import WaterSensor
 from .battery_monitor import BatteryMonitor
+from .data_synchronizer import DataSynchronizer
+from .steering_angle_sensor import SteeringAngleSensor
 
 __all__ = [
     'STM32Communicator',
     'MSSDController',
     'RelayController',
     'WaterSensor',
-    'BatteryMonitor'
+    'BatteryMonitor',
+    'DataSynchronizer',
+    'SteeringAngleSensor'
 ]

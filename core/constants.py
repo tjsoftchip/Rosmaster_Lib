@@ -71,7 +71,7 @@ FUNC_RESET_FLASH = 0xA0
 # R2 机器人参数
 WHEELBASE_R2 = 1.355  # 轴距 1355mm = 1.355m
 TRACK_WIDTH_R2 = 1.140  # 轮距 1140mm = 1.140m
-TIRE_DIAMETER_R2 = 0.65  # 轮胎直径 650mm = 0.65m
+TIRE_DIAMETER_R2 = 0.56  # 轮胎直径 560mm = 0.56m
 MSSD_GEAR_RATIO = 41  # MSSD 减速比 41:1
 
 # 物理常量

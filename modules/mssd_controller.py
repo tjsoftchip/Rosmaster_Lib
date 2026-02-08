@@ -14,6 +14,7 @@ MSSD 无刷电机驱动器控制模块
 import serial
 import time
 import math
+import threading
 from ..utils.crc16 import calculate_crc16
 from ..core.constants import (
     MSSD_DEVICE_ID, MSSD_GEAR_RATIO, TIRE_DIAMETER_R2,
@@ -49,19 +50,22 @@ class MSSDController:
         self.debug = debug
         self.connected = False
         self.ser = None
-        
+
+        # 串口访问锁（与转向角度传感器共享）
+        self._lock = threading.Lock()
+
         # 速度缓存
         self.speed = 0  # 电机速度（RPM）
         self.linear_velocity = 0  # 线速度（m/s）
         self.cached_motor_speed = 0  # 缓存的目标速度（-100~100）
         self.last_update_time = 0  # 上次更新时间
-        
+
         # 物理参数
         self.wheelbase = WHEELBASE_R2  # 轴距
         self.track_width = TRACK_WIDTH_R2  # 轮距
         self.gear_ratio = MSSD_GEAR_RATIO  # 减速比
         self.tire_diameter = TIRE_DIAMETER_R2  # 轮胎直径
-        
+
         # 连接串口
         self._connect()
     
@@ -113,170 +117,212 @@ class MSSDController:
     def _read_registers(self, start_addr, count):
         """
         读取寄存器（功能码 0x03）
-        
+
         Args:
             start_addr: 起始地址
             count: 读取数量
-        
+
         Returns:
             寄存器值列表，失败返回 None
         """
         if not self.connected:
             return None
-        
-        try:
-            # 构建请求帧
-            data = bytes([
-                (start_addr >> 8) & 0xFF,
-                start_addr & 0xFF,
-                (count >> 8) & 0xFF,
-                count & 0xFF
-            ])
-            
-            frame = bytes([self.device_id, 0x03]) + data
-            crc = calculate_crc16(frame)
-            frame += bytes([crc & 0xFF, (crc >> 8) & 0xFF])
-            
-            # 发送请求
-            self.ser.write(frame)
-            self.ser.flush()
-            
-            # 读取响应
-            time.sleep(0.01)
-            response = self.ser.read(5 + 2 * count)
-            
-            if len(response) < 5:
-                return None
-            
-            # 验证 CRC
-            received_crc = (response[-1] << 8) | response[-2]
-            calculated_crc = calculate_crc16(response[:-2])
-            
-            if received_crc != calculated_crc:
+
+        # 使用锁保护串口访问
+        with self._lock:
+            try:
+                # 构建请求帧
+                data = bytes([
+                    (start_addr >> 8) & 0xFF,
+                    start_addr & 0xFF,
+                    (count >> 8) & 0xFF,
+                    count & 0xFF
+                ])
+
+                frame = bytes([self.device_id, 0x03]) + data
+                crc = calculate_crc16(frame)
+                frame += bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+
+                # 发送请求（不清空缓冲区，避免干扰其他操作）
+                self.ser.write(frame)
+                self.ser.flush()
+
+                # 读取响应
+                time.sleep(0.01)
+                response = self.ser.read(5 + 2 * count)
+
+                if len(response) < 5:
+                    return None
+
+                # 验证设备 ID
+                if response[0] != self.device_id:
+                    if self.debug:
+                        print(f"[MSSD] 设备 ID 不匹配: 期望 {self.device_id}, 实际 {response[0]}")
+                    return None
+
+                # 验证功能码
+                if response[1] != 0x03:
+                    if self.debug:
+                        print(f"[MSSD] 功能码不匹配: 期望 0x03, 实际 {response[1]}")
+                    return None
+
+                # 验证 CRC
+                received_crc = (response[-1] << 8) | response[-2]
+                calculated_crc = calculate_crc16(response[:-2])
+
+                if received_crc != calculated_crc:
+                    if self.debug:
+                        print("[MSSD] CRC 校验错误")
+                    return None
+
+                # 解析数据
+                byte_count = response[2]
+                values = []
+                for i in range(byte_count // 2):
+                    high = response[3 + 2 * i]
+                    low = response[4 + 2 * i]
+                    values.append((high << 8) | low)
+
+                return values
+            except Exception as e:
                 if self.debug:
-                    print("[MSSD] CRC 校验错误")
+                    print(f"[MSSD] 读取寄存器错误: {e}")
                 return None
-            
-            # 解析数据
-            byte_count = response[2]
-            values = []
-            for i in range(byte_count // 2):
-                high = response[3 + 2 * i]
-                low = response[4 + 2 * i]
-                values.append((high << 8) | low)
-            
-            return values
-        except Exception as e:
-            if self.debug:
-                print(f"[MSSD] 读取寄存器错误: {e}")
-            return None
     
     def _write_register(self, addr, value):
         """
         写寄存器（功能码 0x06）
-        
+
         Args:
             addr: 寄存器地址
             value: 写入值
-        
+
         Returns:
             是否成功
         """
         if not self.connected:
             return False
-        
-        try:
-            # 构建请求帧
-            data = bytes([
-                (addr >> 8) & 0xFF,
-                addr & 0xFF,
-                (value >> 8) & 0xFF,
-                value & 0xFF
-            ])
-            
-            frame = bytes([self.device_id, 0x06]) + data
-            crc = calculate_crc16(frame)
-            frame += bytes([crc & 0xFF, (crc >> 8) & 0xFF])
-            
-            # 发送请求
-            self.ser.write(frame)
-            self.ser.flush()
-            
-            # 读取响应
-            time.sleep(0.01)
-            response = self.ser.read(8)
-            
-            if len(response) != 8:
+
+        # 使用锁保护串口访问
+        with self._lock:
+            try:
+                # 构建请求帧
+                data = bytes([
+                    (addr >> 8) & 0xFF,
+                    addr & 0xFF,
+                    (value >> 8) & 0xFF,
+                    value & 0xFF
+                ])
+
+                frame = bytes([self.device_id, 0x06]) + data
+                crc = calculate_crc16(frame)
+                frame += bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+
+                # 发送请求（不清空缓冲区，避免干扰其他操作）
+                self.ser.write(frame)
+                self.ser.flush()
+
+                # 读取响应
+                time.sleep(0.01)
+                response = self.ser.read(8)
+
+                if len(response) != 8:
+                    return False
+
+                # 验证设备 ID
+                if response[0] != self.device_id:
+                    if self.debug:
+                        print(f"[MSSD] 设备 ID 不匹配: 期望 {self.device_id}, 实际 {response[0]}")
+                    return False
+
+                # 验证功能码
+                if response[1] != 0x06:
+                    if self.debug:
+                        print(f"[MSSD] 功能码不匹配: 期望 0x06, 实际 {response[1]}")
+                    return False
+
+                # 验证 CRC
+                received_crc = (response[-1] << 8) | response[-2]
+                calculated_crc = calculate_crc16(response[:-2])
+
+                return received_crc == calculated_crc
+            except Exception as e:
+                if self.debug:
+                    print(f"[MSSD] 写寄存器错误: {e}")
                 return False
-            
-            # 验证 CRC
-            received_crc = (response[-1] << 8) | response[-2]
-            calculated_crc = calculate_crc16(response[:-2])
-            
-            return received_crc == calculated_crc
-        except Exception as e:
-            if self.debug:
-                print(f"[MSSD] 写寄存器错误: {e}")
-            return False
     
     def _write_registers(self, start_addr, values):
         """
         写多个寄存器（功能码 0x10）
-        
+
         Args:
             start_addr: 起始地址
             values: 写入值列表
-        
+
         Returns:
             是否成功
         """
         if not self.connected:
             return False
-        
-        try:
-            count = len(values)
-            byte_count = count * 2
-            
-            # 构建数据
-            data = bytes([
-                (start_addr >> 8) & 0xFF,
-                start_addr & 0xFF,
-                (count >> 8) & 0xFF,
-                count & 0xFF,
-                byte_count
-            ])
-            
-            for value in values:
-                data += bytes([
-                    (value >> 8) & 0xFF,
-                    value & 0xFF
+
+        # 使用锁保护串口访问
+        with self._lock:
+            try:
+                count = len(values)
+                byte_count = count * 2
+
+                # 构建数据
+                data = bytes([
+                    (start_addr >> 8) & 0xFF,
+                    start_addr & 0xFF,
+                    (count >> 8) & 0xFF,
+                    count & 0xFF,
+                    byte_count
                 ])
-            
-            # 构建帧
-            frame = bytes([self.device_id, 0x10]) + data
-            crc = calculate_crc16(frame)
-            frame += bytes([crc & 0xFF, (crc >> 8) & 0xFF])
-            
-            # 发送请求
-            self.ser.write(frame)
-            self.ser.flush()
-            
-            # 读取响应
-            time.sleep(0.01)
-            response = self.ser.read(8)
-            
-            if len(response) != 8:
+
+                for value in values:
+                    data += bytes([
+                        (value >> 8) & 0xFF,
+                        value & 0xFF
+                    ])
+
+                # 构建帧
+                frame = bytes([self.device_id, 0x10]) + data
+                crc = calculate_crc16(frame)
+                frame += bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+
+                # 发送请求（不清空缓冲区，避免干扰其他操作）
+                self.ser.write(frame)
+                self.ser.flush()
+
+                # 读取响应
+                time.sleep(0.01)
+                response = self.ser.read(8)
+
+                if len(response) != 8:
+                    return False
+
+                # 验证设备 ID
+                if response[0] != self.device_id:
+                    if self.debug:
+                        print(f"[MSSD] 设备 ID 不匹配: 期望 {self.device_id}, 实际 {response[0]}")
+                    return False
+
+                # 验证功能码
+                if response[1] != 0x10:
+                    if self.debug:
+                        print(f"[MSSD] 功能码不匹配: 期望 0x10, 实际 {response[1]}")
+                    return False
+
+                # 验证 CRC
+                received_crc = (response[-1] << 8) | response[-2]
+                calculated_crc = calculate_crc16(response[:-2])
+
+                return received_crc == calculated_crc
+            except Exception as e:
+                if self.debug:
+                    print(f"[MSSD] 写多个寄存器错误: {e}")
                 return False
-            
-            # 验证 CRC
-            received_crc = (response[-1] << 8) | response[-2]
-            calculated_crc = calculate_crc16(response[:-2])
-            
-            return received_crc == calculated_crc
-        except Exception as e:
-            if self.debug:
-                print(f"[MSSD] 写多个寄存器错误: {e}")
-            return False
     
     def set_speed(self, speed_rpm):
         """
@@ -459,42 +505,6 @@ class MSSDController:
             if self.debug:
                 print(f"[MSSD] 获取编码器错误: {e}")
             return 0
-    
-    def calculate_differential_encoder(self, motor_encoder, steer_angle):
-        """
-        根据单电机编码器和转向角度计算左右后轮编码器
-        
-        基于阿克曼转向几何模型
-        
-        Args:
-            motor_encoder: 电机编码器值
-            steer_angle: 转向角度（度）
-        
-        Returns:
-            (left_encoder, right_encoder)
-        """
-        # 直线行驶
-        if abs(steer_angle) < 0.5:  # 小于 0.5 度视为直线
-            return motor_encoder, motor_encoder
-        
-        # 转换为弧度
-        theta = math.radians(steer_angle)
-        
-        # 计算转弯半径
-        R = self.wheelbase / math.tan(theta)
-        
-        # 计算左右轮比例
-        left_ratio = (R - self.track_width / 2) / R
-        right_ratio = (R + self.track_width / 2) / R
-        
-        # 计算左右轮编码器
-        left_encoder = int(motor_encoder * left_ratio)
-        right_encoder = int(motor_encoder * right_ratio)
-        
-        if self.debug:
-            print(f"[MSSD] 差速计算: R={R:.2f}m, left_ratio={left_ratio:.3f}, right_ratio={right_ratio:.3f}")
-        
-        return left_encoder, right_encoder
     
     def get_status(self):
         """

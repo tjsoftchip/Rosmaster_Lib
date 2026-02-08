@@ -75,9 +75,6 @@ class WaterSensor:
                 self.relay.ser.write(frame)
                 self.relay.ser.flush()
                 
-                # 清空缓冲区，避免残留数据
-                self.relay.ser.reset_input_buffer()
-                
                 # 读取响应
                 time.sleep(0.02)
                 response = self.relay.ser.read(7)
@@ -85,6 +82,17 @@ class WaterSensor:
                 if len(response) != 7:
                     if self.debug:
                         print(f"[WaterSensor] 响应长度不正确: 期望 7 字节, 实际 {len(response)} 字节")
+                    return None
+                
+                # 验证设备 ID 和功能码
+                if response[0] != self.device_id:
+                    if self.debug:
+                        print(f"[WaterSensor] 设备 ID 不匹配: 期望 {self.device_id}, 实际 {response[0]}")
+                    return None
+                
+                if response[1] != 0x03:
+                    if self.debug:
+                        print(f"[WaterSensor] 功能码不匹配: 期望 0x03, 实际 {response[1]}")
                     return None
                 
                 # 验证 CRC
@@ -106,11 +114,6 @@ class WaterSensor:
             except Exception as e:
                 if self.debug:
                     print(f"[WaterSensor] 读取寄存器错误: {e}")
-                # 读取失败时清空缓冲区
-                try:
-                    self.relay.ser.reset_input_buffer()
-                except:
-                    pass
                 return None
     
     def _read_holding_register_average(self, register_addr, count=5):

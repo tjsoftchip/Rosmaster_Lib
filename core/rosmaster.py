@@ -13,12 +13,14 @@ Rosmaster 主类（重构版）
 
 import time
 import math
+import threading
 from .constants import *
 from ..modules.mssd_controller import MSSDController
 from ..modules.relay_controller import RelayController
 from ..modules.water_sensor import WaterSensor
 from ..modules.battery_monitor import BatteryMonitor
 from ..modules.stm32_comm import STM32Communicator
+from ..modules.data_synchronizer import DataSynchronizer
 
 
 class Rosmaster:
@@ -35,7 +37,7 @@ class Rosmaster:
     - 水位检测
     
     支持车型：
-    - X3, X3 Plus, X1, R2, R2_MSSD
+    - X3, X3 Plus, X1, R2 (仅 STM32，无继电器), R2_MSSD (STM32 + MSSD + 继电器)
     """
     
     def __init__(self, car_type=5, com="/dev/myserial", delay=0.002, 
@@ -56,12 +58,13 @@ class Rosmaster:
         self.debug = debug
         self.delay = delay
         
-        # 兼容性处理：R2 车型默认启用 MSSD（根据原版代码）
+        # 兼容性处理：R2 和 R2_MSSD 模式都启用完整功能（MSSD + 继电器 + 水位 + 电量）
+        # 通过单例模式确保所有节点共享同一个实例，避免串口冲突
         if car_type == 0x05:  # CARTYPE_R2
             self.CAR_TYPE = 0x05
-            self.is_r2_mssd = True  # 默认启用 MSSD（原版逻辑）
+            self.is_r2_mssd = True  # R2 模式也启用完整功能
             if debug:
-                print("[Rosmaster] R2 mode with MSSD enabled (default)")
+                print("[Rosmaster] R2 mode with full features (MSSD + Relay + Water + Battery)")
         elif car_type == 0x06:  # CARTYPE_R2_MSSD
             self.CAR_TYPE = 0x05  # STM32 兼容类型
             self.is_r2_mssd = True
@@ -87,6 +90,9 @@ class Rosmaster:
             self.relay = RelayController(relay_port, RELAY_DEVICE_ID, 9600, debug)
             self.water_sensor = WaterSensor(self.relay, WATER_SENSOR_DEVICE_ID, debug)
             self.battery_monitor = BatteryMonitor(self.relay, BATTERY_MONITOR_DEVICE_ID, debug)
+        
+        # 初始化数据同步器（统一数据更新频率和时间戳对齐）
+        self.data_sync = DataSynchronizer(update_interval=0.04, expire_time=0.1, debug=debug)
         
         # 功能码常量（兼容原版）
         self.FUNC_AUTO_REPORT = FUNC_AUTO_REPORT
@@ -138,6 +144,8 @@ class Rosmaster:
         # 注册限位开关状态变化回调到 STM32
         if self.stm32:
             self.stm32.set_limit_switch_callback(self._handle_limit_switch_change)
+            if debug:
+                print("[Rosmaster] 限位开关回调已注册")
         
         if debug:
             print(f"[Rosmaster] 初始化完成: 车型={CAR_TYPE_NAMES.get(self.CAR_TYPE, 'UNKNOWN')} ({self.CAR_TYPE})")
@@ -145,6 +153,32 @@ class Rosmaster:
     def create_receive_threading(self):
         """创建接收线程"""
         self.stm32.start_receive_thread()
+        
+        # 启动数据同步器
+        if self.is_r2_mssd:
+            self.data_sync.start()
+            
+            # 启动数据更新定时器（每10ms更新一次数据到同步器）
+            self._data_update_timer = threading.Timer(0.01, self._data_update_loop)
+            self._data_update_timer.daemon = True
+            self._data_update_timer.start()
+            
+            if self.debug:
+                print("[Rosmaster] 数据同步器已启动")
+    
+    def _data_update_loop(self):
+        """
+        数据更新循环（定时器回调）
+        
+        定期从传感器读取数据并更新到DataSynchronizer
+        """
+        if self.is_r2_mssd:
+            self._update_data_sync()
+            
+            # 重新调度定时器
+            self._data_update_timer = threading.Timer(0.01, self._data_update_loop)
+            self._data_update_timer.daemon = True
+            self._data_update_timer.start()
     
     def set_car_run(self, state, speed):
         """
@@ -238,49 +272,37 @@ class Rosmaster:
     def set_akm_steering_angle(self, angle, ctrl_car=False):
         """
         控制阿克曼转向角度
-        
-        R2_MSSD 模式：
-        - angle: 目标转向角度（-45~45 度）
-        - 自动应用 3:1 减速器补偿
-        
-        原有模式：
-        - 保持原有逻辑不变
+
+        Args:
+            angle: 转向角度（-34~34 度）
+            ctrl_car: 是否同时控制电机速度
+
+        Returns:
+            是否成功
         """
-        if self.is_r2_mssd:
-            # 应用 3:1 减速器补偿
-            compensated_angle = self._compensate_steer_angle(angle)
-            self.mssd.last_steer_angle = angle
-            
-            if self.debug:
-                print(f"[Rosmaster] Steer angle: {angle}° -> {compensated_angle}° (3:1 ratio)")
-        
         # 调用原有逻辑（STM32 控制舵机）
         try:
-            if int(angle) > 45 or int(angle) < -45:
+            if int(angle) > 34 or int(angle) < -34:
                 return
-            
+
             id = self.stm32.AKM_SERVO_ID
             if ctrl_car:
                 id = self.stm32.AKM_SERVO_ID + 0x80
-            
+
             cmd = [HEAD, DEVICE_ID, 0x00, FUNC_AKM_STEER_ANGLE, id, int(angle)&0xFF]
             cmd[2] = len(cmd) - 1
             checksum = sum(cmd, COMPLEMENT) & 0xff
             cmd.append(checksum)
-            
+
             self.stm32.ser.write(cmd)
-            
+
             if self.debug:
                 print(f"[Rosmaster] akm_steering_angle: {cmd}")
-            
+
             time.sleep(self.delay)
         except Exception as e:
             if self.debug:
                 print(f'[Rosmaster] set_akm_steering_angle error: {e}')
-    
-    def _compensate_steer_angle(self, angle):
-        """应用 3:1 减速器补偿"""
-        return int(angle * 3.0)
     
     def set_car_motion(self, v_x, v_y, v_z):
         """
@@ -301,13 +323,31 @@ class Rosmaster:
             # R2_MSSD 模式（大车底盘）
             # v_x 控制电机速度
             motor_speed = int(v_x * 100)
-            self.set_motor(motor_speed, motor_speed, 0, 0)
-            
+
+            # 检查 MSSD 连接状态
+            if self.mssd and self.mssd.connected:
+                print(f"[Rosmaster] MSSD connected, setting motor speed: {motor_speed}")
+                self.set_motor(motor_speed, motor_speed, 0, 0)
+            else:
+                print(f"[Rosmaster] MSSD NOT connected! mssd={self.mssd}, connected={self.mssd.connected if self.mssd else None}")
+
             # v_z 控制转向角度
-            # 大车底盘：最大旋转速度 3 rad/s = 45 度转向
-            steer_angle = int(v_z * 15)
+            # 大车底盘：根据线速度动态调整转向系数
+            # 实际机械限制：±34.4°（0.6 rad）
+            # 低速时（<0.5m/s）使用大转向系数，充分利用机械能力
+            # 中速时（0.5-1.0m/s）使用中等转向系数
+            # 高速时（>1.0m/s）使用小转向系数，保证安全
+            if abs(v_x) < 0.5:
+                steering_factor = 115  # 低速时大转向（0.3m/s → 34.5°，充分利用机械能力）
+            elif abs(v_x) < 1.0:
+                steering_factor = 68   # 中速时中等转向（1.0m/s → 68°，会被限制为34°）
+            else:
+                steering_factor = 34   # 高速时小转向（3.0m/s → 102°，会被限制为34°）
+
+            steer_angle = int(v_z * steering_factor)
+            print(f"[Rosmaster] Setting steering angle: {steer_angle}° (factor={steering_factor})")
             self.set_akm_steering_angle(steer_angle)
-            
+
             if self.debug:
                 print(f"[Rosmaster] set_car_motion: vx={v_x:.3f}, vz={v_z:.3f} -> motor={motor_speed}, steer={steer_angle}°")
         else:
@@ -343,40 +383,16 @@ class Rosmaster:
         Returns:
             (vx, vy, vz) - 线速度、转向角速度、角速度
         """
-        if self.is_r2_mssd and self.mssd and self.mssd.connected:
-            # R2_MSSD 模式：从 MSSD 读取速度数据
-            import math
-            import time
+        if self.is_r2_mssd:
+            # R2_MSSD 模式：从数据同步器获取同步数据
+            sync_data = self.data_sync.get_sync_data()
             
-            # 定期更新 MSSD 速度数据（每 100ms 更新一次）
-            current_time = time.time()
-            if current_time - self.mssd.last_update_time > 0.1:
-                self.mssd.speed = self.mssd.get_speed()
-                self.mssd.last_update_time = current_time
-                
-                # 转换 RPM 到线速度（m/s）
-                # 减速比：41:1，轮胎直径：650mm
-                # 线速度 = (电机转速 / 60 / 减速比) × π × 轮胎直径
-                self.mssd.linear_velocity = (self.mssd.speed / 60.0 / 41.0) * math.pi * 0.65
+            val_vx = sync_data['vx']
+            val_vy = sync_data['vy']
+            val_vz = sync_data['vz']
             
-            # vx: 线速度（来自 MSSD）
-            val_vx = self.mssd.linear_velocity
-            
-            # vy: 转向角度（来自 STM32，单位：度）
-            val_vy = self.stm32.vy
-            
-            # vz: 角速度（根据转向角度和线速度计算）
-            # 角速度 = 线速度 / 转弯半径
-            # 转弯半径 = 轴距 / tan(转向角度)
-            if abs(val_vy) > 0.5:  # 转向角度大于 0.5 度
-                theta = math.radians(val_vy)
-                R = self.__wheelbase / math.tan(theta)
-                val_vz = val_vx / R
-            else:
-                val_vz = 0  # 直线行驶，角速度为 0
-            
-            if self.debug:
-                print(f"[Rosmaster] MSSD Motion: speed={self.mssd.speed} RPM, vx={val_vx:.3f} m/s, vy={val_vy:.1f}°, vz={val_vz:.3f} rad/s")
+            if self.debug and self.stm32.uart_state == 1:
+                print(f"[Rosmaster] Sync Motion: vx={val_vx:.3f} m/s, vy={val_vy:.1f}°, vz={val_vz:.3f} rad/s")
             
             return val_vx, val_vy, val_vz
         else:
@@ -389,6 +405,41 @@ class Rosmaster:
                 print(f"[Rosmaster] STM32 Motion: vx={val_vx:.3f}, vy={val_vy:.3f}, vz={val_vz:.3f}")
             
             return val_vx, val_vy, val_vz
+    
+    def _update_data_sync(self):
+        """
+        更新数据同步器的数据（内部方法）
+        
+        从STM32和MSSD读取最新数据，更新到DataSynchronizer
+        """
+        if not self.is_r2_mssd:
+            return
+        
+        # 更新MSSD速度
+        if self.mssd and self.mssd.connected:
+            speed_rpm = self.mssd.get_speed()
+            self.data_sync.update_mssd_speed(speed_rpm)
+            
+            # 更新MSSD编码器
+            encoder = self.mssd.get_encoder()
+            self.data_sync.update_mssd_encoder(encoder)
+        
+        # 更新转向角度（从ADC传感器）
+        if self.mssd and hasattr(self.mssd, 'steering_sensor') and self.mssd.steering_sensor:
+            angle = self.mssd.steering_sensor.get_angle(channel=0, use_cache=True, cache_timeout=0.1)
+            if angle is not None:
+                self.data_sync.update_steering_angle(angle)
+        else:
+            # 使用STM32的转向角度作为备用
+            self.data_sync.update_steering_angle(self.stm32.vy)
+        
+        # 更新IMU数据
+        roll, pitch, yaw = self.stm32.get_imu_attitude()
+        self.data_sync.update_imu_data(yaw, roll, pitch)
+        
+        # 更新电池电压
+        voltage = self.stm32.battery_voltage / 10.0  # 转换为V
+        self.data_sync.update_battery_voltage(voltage)
     
     def get_imu_attitude(self):
         """
@@ -486,13 +537,15 @@ class Rosmaster:
     def get_limit_switch_state(self):
         """
         获取限位开关状态
-        
+
         Returns:
             限位开关状态（0=都未触发, 1=上限触发, 2=下限触发, 3=都触发）
+
+        Note:
+            直接读取 STM32 缓存的限位开关状态，不进行主动查询
+            限位开关状态会通过自动上报机制实时更新
         """
-        # 主动查询限位开关状态
-        self.stm32.send_command(self.FUNC_REQUEST_DATA, bytes([self.FUNC_LIMIT_SWITCH, 0x00]))
-        time.sleep(0.05)  # 等待响应
+        # 直接读取缓存的限位开关状态
         return self.stm32.get_limit_switch_state()
     
     # ========== MSSD 相关方法 ==========
@@ -582,7 +635,17 @@ class Rosmaster:
             old_state: 旧的状态
             new_state: 新的状态
         """
+        import time
+
+        if self.debug:
+            print(f"[Rosmaster] 限位开关状态变化: {old_state} -> {new_state}")
+            print(f"[Rosmaster] 限位保护启用: {self.__limit_protection_enabled}")
+            print(f"[Rosmaster] 限位保护模式: {self.__limit_protection_mode}")
+            print(f"[Rosmaster] 继电器控制器: {self.relay is not None}")
+
         if not self.__limit_protection_enabled:
+            if self.debug:
+                print("[Rosmaster] 限位保护未启用，忽略状态变化")
             return
 
         if self.debug:
@@ -593,10 +656,29 @@ class Rosmaster:
             # 监控上限位：检测到 0x01 或 0x03 时停止
             if new_state == 0x01 or new_state == 0x03:
                 if self.debug:
-                    print("[Rosmaster] 上限位触发，停止提升支架")
-                # 只关闭提升继电器（通道7）
+                    print("[Rosmaster] 上限位触发，立即停止提升支架")
+                # 紧急停止：立即关闭提升继电器（通道7）
                 if self.relay:
-                    self.relay.stop_raise_mount()
+                    if self.debug:
+                        print(f"[Rosmaster] 调用 relay.stop_raise_mount()")
+                    success = self.relay.stop_raise_mount()
+                    if self.debug:
+                        print(f"[Rosmaster] 停止提升结果: {success}")
+
+                    # 立即再次检查，确保继电器已关闭
+                    if self.relay.ch7_state:
+                        if self.debug:
+                            print("[Rosmaster] 警告：提升继电器仍然打开，再次尝试关闭")
+                        self.relay.stop_raise_mount()
+
+                    # 额外保护：确保下降通道也是关闭的
+                    if self.relay.ch8_state:
+                        if self.debug:
+                            print("[Rosmaster] 额外保护：关闭下降通道")
+                        self.relay.stop_lower_mount()
+                else:
+                    if self.debug:
+                        print("[Rosmaster] 继电器控制器未初始化")
                 # 关闭保护
                 self._disable_limit_protection()
                 # 调用回调函数
@@ -607,15 +689,37 @@ class Rosmaster:
             # 监控下限位：检测到 0x02 或 0x03 时停止
             if new_state == 0x02 or new_state == 0x03:
                 if self.debug:
-                    print("[Rosmaster] 下限位触发，停止下降支架")
-                # 只关闭下降继电器（通道8）
+                    print("[Rosmaster] 下限位触发，立即停止下降支架")
+                # 紧急停止：立即关闭下降继电器（通道8）
                 if self.relay:
-                    self.relay.stop_lower_mount()
+                    if self.debug:
+                        print(f"[Rosmaster] 调用 relay.stop_lower_mount()")
+                    success = self.relay.stop_lower_mount()
+                    if self.debug:
+                        print(f"[Rosmaster] 停止下降结果: {success}")
+
+                    # 立即再次检查，确保继电器已关闭
+                    if self.relay.ch8_state:
+                        if self.debug:
+                            print("[Rosmaster] 警告：下降继电器仍然打开，再次尝试关闭")
+                        self.relay.stop_lower_mount()
+
+                    # 额外保护：确保提升通道也是关闭的
+                    if self.relay.ch7_state:
+                        if self.debug:
+                            print("[Rosmaster] 额外保护：关闭提升通道")
+                        self.relay.stop_raise_mount()
+                else:
+                    if self.debug:
+                        print("[Rosmaster] 继电器控制器未初始化")
                 # 关闭保护
                 self._disable_limit_protection()
                 # 调用回调函数
                 if self.__limit_protection_callback:
                     self.__limit_protection_callback('lower', new_state)
+        else:
+            if self.debug:
+                print(f"[Rosmaster] 限位模式不匹配: {self.__limit_protection_mode} != 'raise'/'lower'")
 
     def _enable_limit_protection(self, mode, callback=None):
         """
@@ -630,6 +734,7 @@ class Rosmaster:
         self.__limit_protection_callback = callback
         if self.debug:
             print(f"[Rosmaster] 限位保护已启用: 模式={mode}")
+            print(f"[Rosmaster] 限位保护将通过自动上报（25Hz）驱动")
 
     def _disable_limit_protection(self):
         """禁用限位保护（内部方法）"""
@@ -638,7 +743,7 @@ class Rosmaster:
         self.__limit_protection_callback = None
         if self.debug:
             print("[Rosmaster] 限位保护已禁用")
-    
+
     def raise_spray_mount(self):
         """
         升起喷水支架（带限位开关保护）
@@ -650,28 +755,26 @@ class Rosmaster:
             return False
 
         try:
-            # 步骤1: 查询限位开关状态
+            # 先检查限位状态，如果上限位已触发则直接返回失败
             limit_state = self.get_limit_switch_state()
-
-            # 步骤2: 检查上限位是否已触发（主动保护）
             if limit_state == 0x01 or limit_state == 0x03:
                 if self.debug:
-                    print(f"[Rosmaster] 无法提升支架: 上限位已触发 (状态={limit_state})")
+                    print(f"[Rosmaster] 上限位已触发（状态={limit_state}），禁止升起支架")
                 return False
 
-            # 步骤3: 调用继电器控制器升起支架
+            # 调用继电器控制器升起支架
             success = self.relay.raise_spray_mount()
-            
+
             if success:
-                # 步骤4: 启用限位保护（被动保护，事件驱动）
+                # 启用限位保护（被动保护，事件驱动）
                 self._enable_limit_protection('raise')
-            
+
             return success
         except Exception as e:
             if self.debug:
                 print(f"[Rosmaster] 升起喷水支架错误: {e}")
             return False
-    
+
     def lower_spray_mount(self):
         """
         降下喷水支架（带限位开关保护）
@@ -683,27 +786,47 @@ class Rosmaster:
             return False
 
         try:
-            # 步骤1: 查询限位开关状态
+            # 先检查限位状态，如果下限位已触发则直接返回失败
             limit_state = self.get_limit_switch_state()
-
-            # 步骤2: 检查下限位是否已触发（主动保护）
             if limit_state == 0x02 or limit_state == 0x03:
                 if self.debug:
-                    print(f"[Rosmaster] 无法降下支架: 下限位已触发 (状态={limit_state})")
+                    print(f"[Rosmaster] 下限位已触发（状态={limit_state}），禁止降下支架")
                 return False
 
-            # 步骤3: 调用继电器控制器降下支架
+            # 调用继电器控制器降下支架
             success = self.relay.lower_spray_mount()
-            
+
             if success:
-                # 步骤4: 启用限位保护（被动保护，事件驱动）
+                # 启用限位保护（被动保护，事件驱动）
                 self._enable_limit_protection('lower')
-            
+
             return success
         except Exception as e:
             if self.debug:
                 print(f"[Rosmaster] 降下喷水支架错误: {e}")
             return False
+    
+    def stop_raise_mount(self):
+        """
+        停止升起喷水支架（关闭通道7）
+        
+        Returns:
+            是否成功
+        """
+        if self.relay:
+            return self.relay.stop_raise_mount()
+        return False
+    
+    def stop_lower_mount(self):
+        """
+        停止降下喷水支架（关闭通道8）
+        
+        Returns:
+            是否成功
+        """
+        if self.relay:
+            return self.relay.stop_lower_mount()
+        return False
     
     def set_relay_all_off(self):
         """关闭所有继电器"""
@@ -994,6 +1117,158 @@ class Rosmaster:
             return self.stm32.version_H * 1.0 + self.stm32.version_L / 10.0
         
         return -1
+    
+    # ========== 舵机控制方法 ==========
+    
+    def set_uart_servo(self, servo_id, pulse_value, run_time=500):
+        """控制总线舵机"""
+        return self.stm32.set_uart_servo(servo_id, pulse_value, run_time)
+    
+    def set_uart_servo_angle(self, s_id, s_angle, run_time=500):
+        """控制总线舵机角度"""
+        if s_id == 1:
+            if 0 <= s_angle <= 180:
+                value = self._arm_convert_value(s_id, s_angle)
+                return self.stm32.set_uart_servo(s_id, value, run_time)
+        elif s_id == 2:
+            if 0 <= s_angle <= 180:
+                value = self._arm_convert_value(s_id, s_angle)
+                return self.stm32.set_uart_servo(s_id, value, run_time)
+        elif s_id == 3:
+            if 0 <= s_angle <= 180:
+                value = self._arm_convert_value(s_id, s_angle)
+                return self.stm32.set_uart_servo(s_id, value, run_time)
+        elif s_id == 4:
+            if 0 <= s_angle <= 180:
+                value = self._arm_convert_value(s_id, s_angle)
+                return self.stm32.set_uart_servo(s_id, value, run_time)
+        elif s_id == 5:
+            if 0 <= s_angle <= 270:
+                value = self._arm_convert_value(s_id, s_angle)
+                return self.stm32.set_uart_servo(s_id, value, run_time)
+        elif s_id == 6:
+            if 0 <= s_angle <= 180:
+                value = self._arm_convert_value(s_id, s_angle)
+                return self.stm32.set_uart_servo(s_id, value, run_time)
+        return False
+    
+    def set_uart_servo_angle_array(self, angle_s=[90, 90, 90, 90, 90, 180], run_time=500):
+        """控制机械臂所有关节"""
+        return self.stm32.set_arm_ctrl(angle_s, run_time)
+    
+    def set_uart_servo_id(self, servo_id):
+        """设置总线舵机ID"""
+        return self.stm32.set_uart_servo_id(servo_id)
+    
+    def set_uart_servo_torque(self, enable):
+        """设置总线舵机扭矩"""
+        return self.stm32.set_uart_servo_torque(enable)
+    
+    def set_uart_servo_offset(self, servo_id):
+        """设置机械臂中位偏差"""
+        return self.stm32.set_arm_offset(servo_id)
+    
+    def set_uart_servo_ctrl_enable(self, enable):
+        """设置机械臂控制开关"""
+        self.stm32.arm_ctrl_enable = enable
+    
+    # ========== PID控制方法 ==========
+    
+    def set_pid_param(self, kp, ki, kd, forever=False):
+        """设置电机PID参数"""
+        return self.stm32.set_motor_pid(kp, ki, kd, forever)
+    
+    # ========== RGB灯带控制方法 ==========
+    
+    def set_colorful_lamps(self, led_id, red, green, blue):
+        """设置RGB灯带颜色"""
+        return self.stm32.set_colorful_lamps(led_id, red, green, blue)
+    
+    # ========== 系统控制方法 ==========
+    
+    def reset_flash_value(self):
+        """重置Flash数据"""
+        return self.stm32.reset_flash_value()
+    
+    def reset_car_state(self):
+        """重置小车状态"""
+        return self.stm32.reset_car_state()
+    
+    def clear_auto_report_data(self):
+        """清除自动上报缓存数据"""
+        self.stm32.vx = 0
+        self.stm32.vy = 0
+        self.stm32.vz = 0
+        self.stm32.ax = 0
+        self.stm32.ay = 0
+        self.stm32.az = 0
+        self.stm32.gx = 0
+        self.stm32.gy = 0
+        self.stm32.gz = 0
+        self.stm32.mx = 0
+        self.stm32.my = 0
+        self.stm32.mz = 0
+        self.stm32.yaw = 0
+        self.stm32.roll = 0
+        self.stm32.pitch = 0
+    
+    # ========== 数据获取方法 ==========
+    
+    def get_uart_servo_value(self):
+        """获取总线舵机脉冲值"""
+        return self.stm32.get_uart_servo_value()
+    
+    def get_uart_servo_angle(self, s_id):
+        """获取总线舵机角度"""
+        return self.stm32.get_uart_servo_angle(s_id)
+    
+    def get_uart_servo_angle_array(self):
+        """获取机械臂角度数组"""
+        return self.stm32.get_uart_servo_angle_array()
+    
+    def get_mpu_raw_data(self):
+        """获取MPU9250原始数据"""
+        return (self.stm32.ax, self.stm32.ay, self.stm32.az,
+                self.stm32.gx, self.stm32.gy, self.stm32.gz,
+                self.stm32.mx, self.stm32.my, self.stm32.mz)
+    
+    def get_icm_raw_data(self):
+        """获取ICM20948原始数据"""
+        return (self.stm32.ax, self.stm32.ay, self.stm32.az,
+                self.stm32.gx, self.stm32.gy, self.stm32.gz,
+                self.stm32.mx, self.stm32.my, self.stm32.mz)
+    
+    def get_motion_pid(self, motor_id):
+        """获取电机PID参数"""
+        return self.stm32.get_motion_pid(motor_id)
+    
+    def get_yaw_pid(self):
+        """获取偏航PID参数"""
+        return self.stm32.get_yaw_pid()
+    
+    def get_akm_default_angle(self):
+        """获取阿克曼默认角度"""
+        return self.stm32.get_akm_default_angle()
+    
+    def get_car_type_from_machine(self):
+        """从机器获取车型"""
+        return self.stm32.get_car_type_from_machine()
+    
+    # ========== 阿克曼控制方法 ==========
+    
+    def set_akm_default_angle(self, angle, forever=False):
+        """设置阿克曼默认角度"""
+        return self.stm32.set_akm_default_angle(angle, forever)
+    
+    # ========== 内部工具方法 ==========
+    
+    def _arm_convert_value(self, s_id, s_angle):
+        """将角度转换为脉冲值"""
+        return self.stm32._arm_convert_value(s_id, s_angle)
+    
+    def _arm_convert_angle(self, s_id, s_value):
+        """将脉冲值转换为角度"""
+        return self.stm32._arm_convert_angle(s_id, s_value)
     
     def set_colorful_effect(self, effect, speed=255, parm=255):
         """
