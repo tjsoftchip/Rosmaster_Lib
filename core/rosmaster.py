@@ -225,7 +225,9 @@ class Rosmaster:
             # 变化检测
             if abs(motor_speed - self.mssd.cached_motor_speed) > self.mssd.speed_change_threshold:
                 # 速度变化，发送 MSSD 指令
-                target_rpm = int(motor_speed * 36)
+                # 修复：系数从36改为14，使实际速度与设置速度匹配
+                # motor_speed * 14 = v_x * 100 * 14 = v_x * 1400 RPM
+                target_rpm = int(motor_speed * 14)
                 
                 if self.mssd.set_speed(target_rpm):
                     self.mssd.cached_motor_speed = motor_speed
@@ -317,39 +319,60 @@ class Rosmaster:
         Args:
             v_x: 线速度（m/s）
             v_y: 侧向速度（m/s，R2 车型忽略）
-            v_z: 角速度（rad/s）
+            v_z: 转向控制值（-1~1 映射到 -34°~34°）
         """
         if self.is_r2_mssd:
             # R2_MSSD 模式（大车底盘）
-            # v_x 控制电机速度
+            # 
+            # ============================================================
+            # 1. 电机速度计算（修复速度放大问题）
+            # ============================================================
+            # 物理参数：
+            # - 轮径 = 0.56m
+            # - 减速比 = 41:1
+            # - 线速度 v_x (m/s) → 轮子转速 = v_x / (π * 0.56) * 60 RPM
+            # - 电机转速 = 轮子转速 * 41 = v_x * 1398 RPM
+            # 
+            # 正确的转换：
+            # target_rpm = v_x * 1400 (约)
+            # 由于 motor_speed = v_x * 100，所以：
+            # target_rpm = motor_speed * 14
+            # ============================================================
+            
             motor_speed = int(v_x * 100)
+            target_rpm = motor_speed * 14  # 修复：原为36，现改为14
 
             # 检查 MSSD 连接状态
             if self.mssd and self.mssd.connected:
-                print(f"[Rosmaster] MSSD connected, setting motor speed: {motor_speed}")
+                if self.debug:
+                    print(f"[Rosmaster] MSSD: v_x={v_x:.3f} m/s → motor_speed={motor_speed} → target_rpm={target_rpm}")
                 self.set_motor(motor_speed, motor_speed, 0, 0)
             else:
-                print(f"[Rosmaster] MSSD NOT connected! mssd={self.mssd}, connected={self.mssd.connected if self.mssd else None}")
+                if self.debug:
+                    print(f"[Rosmaster] MSSD NOT connected!")
 
-            # v_z 控制转向角度
-            # 大车底盘：根据线速度动态调整转向系数
-            # 实际机械限制：±34.4°（0.6 rad）
-            # 低速时（<0.5m/s）使用大转向系数，充分利用机械能力
-            # 中速时（0.5-1.0m/s）使用中等转向系数
-            # 高速时（>1.0m/s）使用小转向系数，保证安全
-            if abs(v_x) < 0.5:
-                steering_factor = 115  # 低速时大转向（0.3m/s → 34.5°，充分利用机械能力）
-            elif abs(v_x) < 1.0:
-                steering_factor = 68   # 中速时中等转向（1.0m/s → 68°，会被限制为34°）
-            else:
-                steering_factor = 34   # 高速时小转向（3.0m/s → 102°，会被限制为34°）
-
-            steer_angle = int(v_z * steering_factor)
-            print(f"[Rosmaster] Setting steering angle: {steer_angle}° (factor={steering_factor})")
+            # ============================================================
+            # 2. 转向角度计算（删除分段限制，直接线性映射）
+            # ============================================================
+            # v_z 范围 -1 ~ 1，直接映射到转向角度 -34° ~ 34°
+            # 机械限制：最大转向角度 ±34°
+            # ============================================================
+            
+            MAX_STEER_ANGLE = 34  # 最大转向角度（度）
+            
+            # 线性映射：v_z → 转向角度
+            steer_angle = int(v_z * MAX_STEER_ANGLE)
+            
+            # 限制在机械范围内
+            steer_angle = max(-MAX_STEER_ANGLE, min(MAX_STEER_ANGLE, steer_angle))
+            
+            if self.debug:
+                print(f"[Rosmaster] Steering: v_z={v_z:.3f} → angle={steer_angle}°")
+            
             self.set_akm_steering_angle(steer_angle)
 
             if self.debug:
-                print(f"[Rosmaster] set_car_motion: vx={v_x:.3f}, vz={v_z:.3f} -> motor={motor_speed}, steer={steer_angle}°")
+                print(f"[Rosmaster] set_car_motion: vx={v_x:.3f} m/s, vz={v_z:.3f} → motor={motor_speed}, steer={steer_angle}°")
         else:
             # 原有模式：发送 FUNC_MOTION 指令到 STM32
             import struct
@@ -609,18 +632,24 @@ class Rosmaster:
             return self.relay.set_right_valve(open_flag)
         return False
     
+    def set_relay_alarm(self, on_flag):
+        """控制报警器开关（通道5）"""
+        if self.relay:
+            return self.relay.set_alarm(on_flag)
+        return False
+
     def set_relay_pump(self, on_flag):
-        """控制水泵"""
+        """控制水泵喷水开关（通道6，同时负责水泵的开关）"""
         if self.relay:
             return self.relay.set_pump(on_flag)
         return False
-    
+
     def start_spray(self):
         """开始喷水"""
         if self.relay:
             return self.relay.start_spraying()
         return False
-    
+
     def stop_spray(self):
         """停止喷水"""
         if self.relay:

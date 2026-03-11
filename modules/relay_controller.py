@@ -12,8 +12,8 @@
 - CH1: 左侧水阀
 - CH2: 右侧展臂
 - CH3: 右侧水阀
-- CH4: 水泵电源
-- CH5: 水泵喷水开关
+- CH4: 报警器开关
+- CH5: 水泵喷水开关（同时负责水泵的开关）
 - CH6: 升起喷水支架
 - CH7: 降下喷水支架
 
@@ -65,8 +65,8 @@ class RelayController:
         self.ch2_state = False  # 左侧水阀
         self.ch3_state = False  # 右侧展臂
         self.ch4_state = False  # 右侧水阀
-        self.ch5_state = False  # 水泵电源
-        self.ch6_state = False  # 水泵喷水开关
+        self.ch5_state = False  # 报警器开关
+        self.ch6_state = False  # 水泵喷水开关（同时负责水泵的开关）
         self.ch7_state = False  # 升起喷水支架
         self.ch8_state = False  # 降下喷水支架
         
@@ -326,13 +326,13 @@ class RelayController:
                 print(f"[Relay] 右侧水阀: {'开启' if open_flag else '关闭'}")
         return success
     
-    def set_pump(self, on_flag):
+    def set_alarm(self, on_flag):
         """
-        控制水泵开关（通道5）
-        
+        控制报警器开关（通道5）
+
         Args:
             on_flag: True=开启，False=关闭
-        
+
         Returns:
             是否成功
         """
@@ -340,16 +340,16 @@ class RelayController:
         if success:
             self.ch5_state = on_flag
             if self.debug:
-                print(f"[Relay] 水泵: {'开启' if on_flag else '关闭'}")
+                print(f"[Relay] 报警器: {'开启' if on_flag else '关闭'}")
         return success
     
-    def set_spray_switch(self, on_flag):
+    def set_pump(self, on_flag):
         """
-        控制水泵喷水开关（通道6）
-        
+        控制水泵喷水开关（通道6，同时负责水泵的开关）
+
         Args:
             on_flag: True=开启，False=关闭
-        
+
         Returns:
             是否成功
         """
@@ -357,7 +357,7 @@ class RelayController:
         if success:
             self.ch6_state = on_flag
             if self.debug:
-                print(f"[Relay] 喷水开关: {'开启' if on_flag else '关闭'}")
+                print(f"[Relay] 水泵喷水: {'开启' if on_flag else '关闭'}")
         return success
 
     def raise_spray_mount(self):
@@ -450,7 +450,7 @@ class RelayController:
 
     def start_spraying(self):
         """
-        开始喷水（先给水泵上电，然后打开喷水开关）
+        开始喷水（打开通道6：水泵喷水开关，同时负责水泵的开关）
 
         Returns:
             是否成功
@@ -461,27 +461,16 @@ class RelayController:
             return False
 
         try:
-            # 步骤1：打开水泵电源（通道5）
-            success = self._write_coil(4, 1)
-            if not success:
-                if self.debug:
-                    print("[Relay] 打开水泵电源失败")
-                return False
-
-            self.ch5_state = True
-            if self.debug:
-                print("[Relay] 水泵电源: ON")
-
-            # 步骤2：打开喷水开关（通道6）
+            # 打开水泵喷水开关（通道6）
             success = self._write_coil(5, 1)
             if not success:
                 if self.debug:
-                    print("[Relay] 打开喷水开关失败")
+                    print("[Relay] 打开水泵喷水开关失败")
                 return False
 
             self.ch6_state = True
             if self.debug:
-                print("[Relay] 喷水开关: ON，开始喷水")
+                print("[Relay] 水泵喷水: ON，开始喷水")
 
             return True
         except Exception as e:
@@ -491,8 +480,8 @@ class RelayController:
     
     def stop_spraying(self):
         """
-        停止喷水（先关闭水泵电源，再关闭喷水开关）
-        
+        停止喷水（关闭通道6：水泵喷水开关，同时负责水泵的开关）
+
         Returns:
             是否成功
         """
@@ -500,30 +489,19 @@ class RelayController:
             if self.debug:
                 print("[Relay] 未连接")
             return False
-        
+
         try:
-            # 步骤1：关闭水泵电源（通道5）
-            success = self._write_coil(4, 0)
-            if not success:
-                if self.debug:
-                    print("[Relay] 关闭水泵电源失败")
-                return False
-            
-            self.ch5_state = False
-            if self.debug:
-                print("[Relay] 水泵电源: OFF")
-            
-            # 步骤2：关闭喷水开关（通道6）
+            # 关闭水泵喷水开关（通道6）
             success = self._write_coil(5, 0)
             if not success:
                 if self.debug:
-                    print("[Relay] 关闭喷水开关失败")
+                    print("[Relay] 关闭水泵喷水开关失败")
                 return False
-            
+
             self.ch6_state = False
             if self.debug:
-                print("[Relay] 喷水开关: OFF，停止喷水")
-            
+                print("[Relay] 水泵喷水: OFF，停止喷水")
+
             return True
         except Exception as e:
             if self.debug:
@@ -560,15 +538,15 @@ class RelayController:
     def emergency_stop(self):
         """
         紧急停止
-        
+
         关闭：
-        - 水泵电源（通道5）
+        - 报警器（通道5）
         - 水泵喷水开关（通道6）
         - 升起喷水支架（通道7）
         - 降下喷水支架（通道8）
-        
+
         其他开关保持当前状态不变
-        
+
         Returns:
             是否成功
         """
@@ -576,37 +554,37 @@ class RelayController:
             if self.debug:
                 print("[Relay] 未连接")
             return False
-        
+
         try:
             success = True
-            
-            # 关闭水泵电源（通道5）
+
+            # 关闭报警器（通道5）
             if self.ch5_state:
                 if not self._write_coil(4, 0):
                     success = False
                 self.ch5_state = False
-            
+
             # 关闭水泵喷水开关（通道6）
             if self.ch6_state:
                 if not self._write_coil(5, 0):
                     success = False
                 self.ch6_state = False
-            
+
             # 关闭升起喷水支架（通道7）
             if self.ch7_state:
                 if not self._write_coil(6, 0):
                     success = False
                 self.ch7_state = False
-            
+
             # 关闭降下喷水支架（通道8）
             if self.ch8_state:
                 if not self._write_coil(7, 0):
                     success = False
                 self.ch8_state = False
-            
+
             if self.debug:
-                print("[Relay] 紧急停止：已关闭水泵和支架控制")
-            
+                print("[Relay] 紧急停止：已关闭报警器、水泵和支架控制")
+
             return success
         except Exception as e:
             if self.debug:
@@ -616,7 +594,7 @@ class RelayController:
     def get_states(self):
         """
         获取所有继电器状态
-        
+
         Returns:
             状态字典
         """
@@ -625,8 +603,8 @@ class RelayController:
             'ch2': self.ch2_state,  # 左侧水阀
             'ch3': self.ch3_state,  # 右侧展臂
             'ch4': self.ch4_state,  # 右侧水阀
-            'ch5': self.ch5_state,  # 水泵电源
-            'ch6': self.ch6_state,  # 水泵喷水开关
+            'ch5': self.ch5_state,  # 报警器开关
+            'ch6': self.ch6_state,  # 水泵喷水开关（同时负责水泵的开关）
             'ch7': self.ch7_state,  # 升起喷水支架
             'ch8': self.ch8_state   # 降下喷水支架
         }
