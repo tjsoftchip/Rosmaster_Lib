@@ -77,6 +77,7 @@ class STM32Communicator:
         self.encoder_m4 = 0  # 编码器4
         self.battery_voltage = 0  # 电池电压
         self.limit_switch_state = 0  # 限位开关状态
+        self.limit_switch_timestamp = 0  # 限位开关状态更新时间戳
         self.version_H = 0  # 版本号高位
         self.version_L = 0  # 版本号低位
         
@@ -307,6 +308,7 @@ class STM32Communicator:
             if len(ext_data) >= 8:
                 old_state = self.limit_switch_state
                 self.limit_switch_state = struct.unpack('B', bytearray(ext_data[7:8]))[0]
+                self.limit_switch_timestamp = time.time()  # 更新时间戳
                 
                 # 检测限位开关状态变化并触发回调
                 if old_state != self.limit_switch_state and self.limit_switch_callback:
@@ -375,6 +377,7 @@ class STM32Communicator:
             # [0] HEAD, [1] DEVICE_ID-1, [2] LENGTH, [3] FUNC, [4] 状态, [5] 保留, [6] 校验和
             old_state = self.limit_switch_state
             self.limit_switch_state = struct.unpack('B', bytearray(ext_data[0:1]))[0]
+            self.limit_switch_timestamp = time.time()  # 更新时间戳
             # ext_data[1] 是保留字节，暂时忽略
             if self.debug:
                 print(f"[STM32] 限位开关状态: {self.limit_switch_state}")
@@ -498,6 +501,15 @@ class STM32Communicator:
     def get_limit_switch_state(self):
         """获取限位开关状态"""
         return self.limit_switch_state
+    
+    def get_limit_switch_state_with_timestamp(self):
+        """
+        获取限位开关状态和时间戳
+        
+        Returns:
+            tuple: (状态, 时间戳)
+        """
+        return self.limit_switch_state, self.limit_switch_timestamp
     
     def set_limit_switch_callback(self, callback):
         """

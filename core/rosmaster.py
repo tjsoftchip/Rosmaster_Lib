@@ -582,6 +582,33 @@ class Rosmaster:
         # 直接读取缓存的限位开关状态
         return self.stm32.get_limit_switch_state()
     
+    def _wait_for_latest_limit_state(self, timeout=0.1):
+        """
+        等待最新的限位开关状态上报
+        
+        Args:
+            timeout: 最长等待时间（秒），默认 0.1 秒
+            
+        Returns:
+            限位开关状态，如果超时则返回当前状态
+        """
+        import time
+        
+        # 获取当前时间戳
+        _, old_timestamp = self.stm32.get_limit_switch_state_with_timestamp()
+        start_time = time.time()
+        
+        # 等待新的状态上报
+        while time.time() - start_time < timeout:
+            _, new_timestamp = self.stm32.get_limit_switch_state_with_timestamp()
+            if new_timestamp > old_timestamp:
+                # 收到新状态
+                break
+            time.sleep(0.01)  # 等待 10ms
+        
+        # 返回最新状态
+        return self.stm32.get_limit_switch_state()
+    
     # ========== MSSD 相关方法 ==========
     
     def get_mssd_speed(self):
@@ -887,10 +914,11 @@ class Rosmaster:
         
         流程：
         1. 先关闭下降继电器（互斥，无论当前状态）
-        2. 检查上限位是否已触发
-        3. 打开上升继电器
-        4. 进入raising状态，等待上限位触发
-        5. 上限位触发后进入raised状态，保持上限位
+        2. 等待最新的限位开关状态上报（最多 100ms）
+        3. 检查上限位是否已触发，如果已触发则不执行
+        4. 打开上升继电器
+        5. 进入raising状态，等待上限位触发
+        6. 上限位触发后进入raised状态，保持上限位
 
         Returns:
             是否成功
@@ -904,19 +932,21 @@ class Rosmaster:
                 print("[Rosmaster] 升起前先关闭下降继电器（互斥）")
             self._stop_mount_relay('lower')
             
-            # 2. 检查上限位是否已触发
-            limit_state = self.get_limit_switch_state()
+            # 2. 等待最新的限位开关状态上报（STM32 25Hz 上报，约 40ms）
+            limit_state = self._wait_for_latest_limit_state(timeout=0.1)
+            
+            # 3. 检查上限位是否已触发
             if limit_state == 0x01 or limit_state == 0x03:
                 if self.debug:
-                    print(f"[Rosmaster] 上限位已触发（状态={limit_state}），进入raised状态")
+                    print(f"[Rosmaster] 上限位已触发（状态={limit_state}），不执行上升，进入raised状态")
                 self.__mount_state = 'raised'
                 return True  # 已在顶部，视为成功
 
-            # 3. 打开上升继电器
+            # 4. 打开上升继电器
             success = self.relay.raise_spray_mount()
 
             if success:
-                # 4. 进入raising状态
+                # 5. 进入raising状态
                 self.__mount_state = 'raising'
                 # 启用限位保护（兼容旧逻辑）
                 self._enable_limit_protection('raise')
@@ -935,10 +965,11 @@ class Rosmaster:
         
         流程：
         1. 先关闭上升继电器（互斥，无论当前状态）
-        2. 检查下限位是否已触发
-        3. 打开下降继电器
-        4. 进入lowering状态，等待下限位触发
-        5. 下限位触发后进入lowered状态，保持下限位
+        2. 等待最新的限位开关状态上报（最多 100ms）
+        3. 检查下限位是否已触发，如果已触发则不执行
+        4. 打开下降继电器
+        5. 进入lowering状态，等待下限位触发
+        6. 下限位触发后进入lowered状态，保持下限位
 
         Returns:
             是否成功
@@ -952,19 +983,21 @@ class Rosmaster:
                 print("[Rosmaster] 下降前先关闭上升继电器（互斥）")
             self._stop_mount_relay('raise')
             
-            # 2. 检查下限位是否已触发
-            limit_state = self.get_limit_switch_state()
+            # 2. 等待最新的限位开关状态上报（STM32 25Hz 上报，约 40ms）
+            limit_state = self._wait_for_latest_limit_state(timeout=0.1)
+            
+            # 3. 检查下限位是否已触发
             if limit_state == 0x02 or limit_state == 0x03:
                 if self.debug:
-                    print(f"[Rosmaster] 下限位已触发（状态={limit_state}），进入lowered状态")
+                    print(f"[Rosmaster] 下限位已触发（状态={limit_state}），不执行下降，进入lowered状态")
                 self.__mount_state = 'lowered'
                 return True  # 已在底部，视为成功
 
-            # 3. 打开下降继电器
+            # 4. 打开下降继电器
             success = self.relay.lower_spray_mount()
 
             if success:
-                # 4. 进入lowering状态
+                # 5. 进入lowering状态
                 self.__mount_state = 'lowering'
                 # 启用限位保护（兼容旧逻辑）
                 self._enable_limit_protection('lower')
