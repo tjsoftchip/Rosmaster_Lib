@@ -367,17 +367,13 @@ class RelayController:
         Returns:
             是否成功
         """
-        # 先关闭降下通道（互斥）
-        if self.ch8_state:
-            success_close = self._write_coil(7, 0)
-            if success_close:
-                self.ch8_state = False
-                if self.debug:
-                    print("[Relay] 已关闭降下通道（互斥保护）")
-            else:
-                if self.debug:
-                    print("[Relay] 关闭降下通道失败")
-                return False
+        # 先关闭降下通道（互斥，无论当前状态）
+        if self.debug:
+            print("[Relay] 升起前先关闭降下通道（互斥）")
+        success_close = self._write_coil(7, 0)
+        self.ch8_state = False  # 无论成功与否都更新状态
+        if not success_close and self.debug:
+            print("[Relay] 关闭降下通道失败，继续尝试升起")
 
         # 打开升起通道
         success = self._write_coil(6, 1)
@@ -394,17 +390,13 @@ class RelayController:
         Returns:
             是否成功
         """
-        # 先关闭升起通道（互斥）
-        if self.ch7_state:
-            success_close = self._write_coil(6, 0)
-            if success_close:
-                self.ch7_state = False
-                if self.debug:
-                    print("[Relay] 已关闭升起通道（互斥保护）")
-            else:
-                if self.debug:
-                    print("[Relay] 关闭升起通道失败")
-                return False
+        # 先关闭升起通道（互斥，无论当前状态）
+        if self.debug:
+            print("[Relay] 下降前先关闭升起通道（互斥）")
+        success_close = self._write_coil(6, 0)
+        self.ch7_state = False  # 无论成功与否都更新状态
+        if not success_close and self.debug:
+            print("[Relay] 关闭升起通道失败，继续尝试下降")
 
         # 打开降下通道
         success = self._write_coil(7, 1)
@@ -417,35 +409,49 @@ class RelayController:
     def stop_raise_mount(self):
         """
         停止升起喷水支架（关闭通道7）
+        
+        注意：限位保护场景下必须确保继电器关闭，不依赖本地状态变量判断
 
         Returns:
             是否成功
         """
-        if not self.ch7_state:
-            return True  # 已经关闭
-
+        # 修复：限位保护场景下必须发送关闭命令，不依赖本地状态
+        # 因为本地状态可能与实际继电器状态不同步
+        
         success = self._write_coil(6, 0)
         if success:
             self.ch7_state = False
             if self.debug:
                 print("[Relay] 停止升起喷水支架")
+        else:
+            # 即使失败也更新状态，强制重新发送命令
+            if self.debug:
+                print("[Relay] 停止升起喷水支架失败，强制重置状态")
+            self.ch7_state = True  # 保持True，下次会重试
         return success
 
     def stop_lower_mount(self):
         """
         停止降下喷水支架（关闭通道8）
+        
+        注意：限位保护场景下必须确保继电器关闭，不依赖本地状态变量判断
 
         Returns:
             是否成功
         """
-        if not self.ch8_state:
-            return True  # 已经关闭
-
+        # 修复：限位保护场景下必须发送关闭命令，不依赖本地状态
+        # 因为本地状态可能与实际继电器状态不同步
+        
         success = self._write_coil(7, 0)
         if success:
             self.ch8_state = False
             if self.debug:
                 print("[Relay] 停止降下喷水支架")
+        else:
+            # 即使失败也更新状态，强制重新发送命令
+            if self.debug:
+                print("[Relay] 停止降下喷水支架失败，强制重置状态")
+            self.ch8_state = True  # 保持True，下次会重试
         return success
 
     def start_spraying(self):

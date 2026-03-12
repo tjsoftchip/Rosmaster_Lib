@@ -138,8 +138,15 @@ class Rosmaster:
         
         # 限位保护相关变量
         self.__limit_protection_enabled = False  # 限位保护开关
-        self.__limit_protection_mode = None  # 保护模式: 'raise' 或 'lower'
+        self.__limit_protection_mode = None  # 保护模式: 'raise', 'lower', 'raised', 'lowered', 'idle'
         self.__limit_protection_callback = None  # 限位触发回调函数
+        
+        # 支架状态：'idle', 'raising', 'raised', 'lowering', 'lowered'
+        self.__mount_state = 'idle'
+        
+        # 状态保持检查相关变量
+        self.__last_state_check_time = time.time()  # 上次状态检查时间
+        self.__state_check_interval = 30.0  # 状态检查间隔（秒）
         
         # 注册限位开关状态变化回调到 STM32
         if self.stm32:
@@ -171,9 +178,13 @@ class Rosmaster:
         数据更新循环（定时器回调）
         
         定期从传感器读取数据并更新到DataSynchronizer
+        同时检查支架状态保持（每30秒）
         """
         if self.is_r2_mssd:
             self._update_data_sync()
+            
+            # 检查支架状态保持（内部有30秒间隔判断）
+            self._check_state_maintenance()
             
             # 重新调度定时器
             self._data_update_timer = threading.Timer(0.01, self._data_update_loop)
@@ -659,6 +670,16 @@ class Rosmaster:
     def _handle_limit_switch_change(self, old_state, new_state):
         """
         处理限位开关状态变化（内部方法）
+        
+        状态保持机制（定时检查，每30秒）：
+        - raised状态：必须保持上限位触发，如果颠簸导致下滑，定时检查后自动启动上升
+        - lowered状态：必须保持下限位触发，如果颠簸导致上滑，定时检查后自动启动下降
+        
+        限位状态定义：
+        - 0x00: 都未触发
+        - 0x01: 上限位触发
+        - 0x02: 下限位触发
+        - 0x03: 都触发（异常状态）
 
         Args:
             old_state: 旧的状态
@@ -668,87 +689,174 @@ class Rosmaster:
 
         if self.debug:
             print(f"[Rosmaster] 限位开关状态变化: {old_state} -> {new_state}")
+            print(f"[Rosmaster] 支架状态: {self.__mount_state}")
             print(f"[Rosmaster] 限位保护启用: {self.__limit_protection_enabled}")
-            print(f"[Rosmaster] 限位保护模式: {self.__limit_protection_mode}")
-            print(f"[Rosmaster] 继电器控制器: {self.relay is not None}")
 
-        if not self.__limit_protection_enabled:
+        if not self.relay:
             if self.debug:
-                print("[Rosmaster] 限位保护未启用，忽略状态变化")
+                print("[Rosmaster] 继电器控制器未初始化")
             return
 
-        if self.debug:
-            print(f"[Rosmaster] 限位开关状态变化: {old_state} -> {new_state}, 模式={self.__limit_protection_mode}")
-
-        # 根据保护模式处理
-        if self.__limit_protection_mode == 'raise':
-            # 监控上限位：检测到 0x01 或 0x03 时停止
+        # ==================== 限位触发立即关闭继电器 ====================
+        # raising/lowering 状态下，限位触发时立即关闭继电器
+        
+        if self.__mount_state == 'raising':
+            # 正在升起中，检测上限位触发
             if new_state == 0x01 or new_state == 0x03:
                 if self.debug:
-                    print("[Rosmaster] 上限位触发，立即停止提升支架")
-                # 紧急停止：立即关闭提升继电器（通道7）
-                if self.relay:
-                    if self.debug:
-                        print(f"[Rosmaster] 调用 relay.stop_raise_mount()")
-                    success = self.relay.stop_raise_mount()
-                    if self.debug:
-                        print(f"[Rosmaster] 停止提升结果: {success}")
-
-                    # 立即再次检查，确保继电器已关闭
-                    if self.relay.ch7_state:
-                        if self.debug:
-                            print("[Rosmaster] 警告：提升继电器仍然打开，再次尝试关闭")
-                        self.relay.stop_raise_mount()
-
-                    # 额外保护：确保下降通道也是关闭的
-                    if self.relay.ch8_state:
-                        if self.debug:
-                            print("[Rosmaster] 额外保护：关闭下降通道")
-                        self.relay.stop_lower_mount()
-                else:
-                    if self.debug:
-                        print("[Rosmaster] 继电器控制器未初始化")
-                # 关闭保护
-                self._disable_limit_protection()
-                # 调用回调函数
+                    print("[Rosmaster] 上限位触发，停止升起，进入raised状态")
+                # 关闭上升继电器
+                self._stop_mount_relay('raise')
+                self.__mount_state = 'raised'
+                # 重置状态检查时间
+                self.__last_state_check_time = time.time()
+                # 调用回调
                 if self.__limit_protection_callback:
-                    self.__limit_protection_callback('raise', new_state)
-
-        elif self.__limit_protection_mode == 'lower':
-            # 监控下限位：检测到 0x02 或 0x03 时停止
+                    self.__limit_protection_callback('raised', new_state)
+        
+        elif self.__mount_state == 'lowering':
+            # 正在下降中，检测下限位触发
             if new_state == 0x02 or new_state == 0x03:
                 if self.debug:
-                    print("[Rosmaster] 下限位触发，立即停止下降支架")
-                # 紧急停止：立即关闭下降继电器（通道8）
-                if self.relay:
-                    if self.debug:
-                        print(f"[Rosmaster] 调用 relay.stop_lower_mount()")
-                    success = self.relay.stop_lower_mount()
-                    if self.debug:
-                        print(f"[Rosmaster] 停止下降结果: {success}")
-
-                    # 立即再次检查，确保继电器已关闭
-                    if self.relay.ch8_state:
-                        if self.debug:
-                            print("[Rosmaster] 警告：下降继电器仍然打开，再次尝试关闭")
-                        self.relay.stop_lower_mount()
-
-                    # 额外保护：确保提升通道也是关闭的
-                    if self.relay.ch7_state:
-                        if self.debug:
-                            print("[Rosmaster] 额外保护：关闭提升通道")
-                        self.relay.stop_raise_mount()
-                else:
-                    if self.debug:
-                        print("[Rosmaster] 继电器控制器未初始化")
-                # 关闭保护
-                self._disable_limit_protection()
-                # 调用回调函数
+                    print("[Rosmaster] 下限位触发，停止下降，进入lowered状态")
+                # 关闭下降继电器
+                self._stop_mount_relay('lower')
+                self.__mount_state = 'lowered'
+                # 重置状态检查时间
+                self.__last_state_check_time = time.time()
+                # 调用回调
                 if self.__limit_protection_callback:
-                    self.__limit_protection_callback('lower', new_state)
+                    self.__limit_protection_callback('lowered', new_state)
+        
+        # ==================== raised/lowered 状态：不立即响应 ====================
+        # 状态保持检查改为定时检查（每30秒），在 _check_state_maintenance 中处理
+        # 这里只记录日志，不做任何动作
+        
+        elif self.__mount_state == 'raised':
+            # 上限位触发，确保上升继电器关闭
+            if new_state == 0x01 or new_state == 0x03:
+                self._stop_mount_relay('raise')
+            # 状态保持检查在 _check_state_maintenance 中进行
+            elif self.debug and (new_state == 0x00 or new_state == 0x02):
+                print("[Rosmaster] 上限位不再触发，等待定时检查（30秒）")
+        
+        elif self.__mount_state == 'lowered':
+            # 下限位触发，确保下降继电器关闭
+            if new_state == 0x02 or new_state == 0x03:
+                self._stop_mount_relay('lower')
+            # 状态保持检查在 _check_state_maintenance 中进行
+            elif self.debug and (new_state == 0x00 or new_state == 0x01):
+                print("[Rosmaster] 下限位不再触发，等待定时检查（30秒）")
+        
+        # 兼容旧的限位保护模式
+        if self.__limit_protection_enabled:
+            if self.__limit_protection_mode == 'raise':
+                if new_state == 0x01 or new_state == 0x03:
+                    self._stop_mount_relay('raise')
+                    self._stop_mount_relay('lower')
+                    self._disable_limit_protection()
+                    if self.__limit_protection_callback:
+                        self.__limit_protection_callback('raise', new_state)
+            elif self.__limit_protection_mode == 'lower':
+                if new_state == 0x02 or new_state == 0x03:
+                    self._stop_mount_relay('lower')
+                    self._stop_mount_relay('raise')
+                    self._disable_limit_protection()
+                    if self.__limit_protection_callback:
+                        self.__limit_protection_callback('lower', new_state)
+    
+    def _check_state_maintenance(self):
+        """
+        检查状态保持（定时调用，每30秒检查一次）
+        
+        如果 raised 状态下限位不再触发，自动启动上升
+        如果 lowered 状态下限位不再触发，自动启动下降
+        """
+        import time
+        
+        current_time = time.time()
+        
+        # 检查是否到达检查时间
+        if current_time - self.__last_state_check_time < self.__state_check_interval:
+            return
+        
+        # 更新检查时间
+        self.__last_state_check_time = current_time
+        
+        # 获取当前限位状态
+        limit_state = self.get_limit_switch_state()
+        if limit_state is None:
+            return
+        
+        if self.debug:
+            print(f"[Rosmaster] 状态保持检查: mount_state={self.__mount_state}, limit_state={limit_state}")
+        
+        if not self.relay:
+            return
+        
+        # ==================== 状态保持逻辑 ====================
+        
+        if self.__mount_state == 'raised':
+            # 已升起状态，检查上限位是否仍触发
+            if limit_state == 0x00 or limit_state == 0x02:
+                # 上限位不再触发（颠簸下滑），自动启动上升
+                if self.debug:
+                    print("[Rosmaster] 状态保持检查: 上限位不再触发，自动启动上升")
+                # 先确保下降继电器关闭（互斥）
+                self._stop_mount_relay('lower')
+                # 启动上升
+                self._start_mount_relay('raise')
+                self.__mount_state = 'raising'
+        
+        elif self.__mount_state == 'lowered':
+            # 已下降状态，检查下限位是否仍触发
+            if limit_state == 0x00 or limit_state == 0x01:
+                # 下限位不再触发（颠簸上滑），自动启动下降
+                if self.debug:
+                    print("[Rosmaster] 状态保持检查: 下限位不再触发，自动启动下降")
+                # 先确保上升继电器关闭（互斥）
+                self._stop_mount_relay('raise')
+                # 启动下降
+                self._start_mount_relay('lower')
+                self.__mount_state = 'lowering'
+
+    def _stop_mount_relay(self, direction):
+        """
+        停止支架继电器（确保关闭，多次重试）
+        
+        Args:
+            direction: 'raise' 或 'lower'
+        """
+        if not self.relay:
+            return
+        
+        for attempt in range(3):
+            if direction == 'raise':
+                success = self.relay.stop_raise_mount()
+            else:
+                success = self.relay.stop_lower_mount()
+            
+            if success:
+                break
+            time.sleep(0.01)
+        
+        if self.debug:
+            print(f"[Rosmaster] 停止{direction}继电器: {success}")
+
+    def _start_mount_relay(self, direction):
+        """
+        启动支架继电器
+        
+        Args:
+            direction: 'raise' 或 'lower'
+        """
+        if not self.relay:
+            return False
+        
+        if direction == 'raise':
+            return self.relay.raise_spray_mount()
         else:
-            if self.debug:
-                print(f"[Rosmaster] 限位模式不匹配: {self.__limit_protection_mode} != 'raise'/'lower'")
+            return self.relay.lower_spray_mount()
 
     def _enable_limit_protection(self, mode, callback=None):
         """
@@ -775,7 +883,14 @@ class Rosmaster:
 
     def raise_spray_mount(self):
         """
-        升起喷水支架（带限位开关保护）
+        升起喷水支架（带限位开关保护和状态保持）
+        
+        流程：
+        1. 先关闭下降继电器（互斥，无论当前状态）
+        2. 检查上限位是否已触发
+        3. 打开上升继电器
+        4. 进入raising状态，等待上限位触发
+        5. 上限位触发后进入raised状态，保持上限位
 
         Returns:
             是否成功
@@ -784,19 +899,29 @@ class Rosmaster:
             return False
 
         try:
-            # 先检查限位状态，如果上限位已触发则直接返回失败
+            # 1. 互斥操作：先关闭下降继电器（无论当前状态）
+            if self.debug:
+                print("[Rosmaster] 升起前先关闭下降继电器（互斥）")
+            self._stop_mount_relay('lower')
+            
+            # 2. 检查上限位是否已触发
             limit_state = self.get_limit_switch_state()
             if limit_state == 0x01 or limit_state == 0x03:
                 if self.debug:
-                    print(f"[Rosmaster] 上限位已触发（状态={limit_state}），禁止升起支架")
-                return False
+                    print(f"[Rosmaster] 上限位已触发（状态={limit_state}），进入raised状态")
+                self.__mount_state = 'raised'
+                return True  # 已在顶部，视为成功
 
-            # 调用继电器控制器升起支架
+            # 3. 打开上升继电器
             success = self.relay.raise_spray_mount()
 
             if success:
-                # 启用限位保护（被动保护，事件驱动）
+                # 4. 进入raising状态
+                self.__mount_state = 'raising'
+                # 启用限位保护（兼容旧逻辑）
                 self._enable_limit_protection('raise')
+                if self.debug:
+                    print("[Rosmaster] 支架状态: raising")
 
             return success
         except Exception as e:
@@ -806,7 +931,14 @@ class Rosmaster:
 
     def lower_spray_mount(self):
         """
-        降下喷水支架（带限位开关保护）
+        降下喷水支架（带限位开关保护和状态保持）
+        
+        流程：
+        1. 先关闭上升继电器（互斥，无论当前状态）
+        2. 检查下限位是否已触发
+        3. 打开下降继电器
+        4. 进入lowering状态，等待下限位触发
+        5. 下限位触发后进入lowered状态，保持下限位
 
         Returns:
             是否成功
@@ -815,25 +947,44 @@ class Rosmaster:
             return False
 
         try:
-            # 先检查限位状态，如果下限位已触发则直接返回失败
+            # 1. 互斥操作：先关闭上升继电器（无论当前状态）
+            if self.debug:
+                print("[Rosmaster] 下降前先关闭上升继电器（互斥）")
+            self._stop_mount_relay('raise')
+            
+            # 2. 检查下限位是否已触发
             limit_state = self.get_limit_switch_state()
             if limit_state == 0x02 or limit_state == 0x03:
                 if self.debug:
-                    print(f"[Rosmaster] 下限位已触发（状态={limit_state}），禁止降下支架")
-                return False
+                    print(f"[Rosmaster] 下限位已触发（状态={limit_state}），进入lowered状态")
+                self.__mount_state = 'lowered'
+                return True  # 已在底部，视为成功
 
-            # 调用继电器控制器降下支架
+            # 3. 打开下降继电器
             success = self.relay.lower_spray_mount()
 
             if success:
-                # 启用限位保护（被动保护，事件驱动）
+                # 4. 进入lowering状态
+                self.__mount_state = 'lowering'
+                # 启用限位保护（兼容旧逻辑）
                 self._enable_limit_protection('lower')
+                if self.debug:
+                    print("[Rosmaster] 支架状态: lowering")
 
             return success
         except Exception as e:
             if self.debug:
                 print(f"[Rosmaster] 降下喷水支架错误: {e}")
             return False
+    
+    def get_mount_state(self):
+        """
+        获取支架状态
+        
+        Returns:
+            'idle', 'raising', 'raised', 'lowering', 'lowered'
+        """
+        return self.__mount_state
     
     def stop_raise_mount(self):
         """
@@ -843,7 +994,11 @@ class Rosmaster:
             是否成功
         """
         if self.relay:
-            return self.relay.stop_raise_mount()
+            success = self.relay.stop_raise_mount()
+            if success:
+                # 不改变状态，让限位保持机制决定是否需要重新启动
+                pass
+            return success
         return False
     
     def stop_lower_mount(self):
