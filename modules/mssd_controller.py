@@ -59,6 +59,7 @@ class MSSDController:
         self.linear_velocity = 0  # 线速度（m/s）
         self.cached_motor_speed = 0  # 缓存的目标速度（-100~100）
         self.last_update_time = 0  # 上次更新时间
+        self._motor_started = False  # 电机启动状态跟踪
 
         # 物理参数
         self.wheelbase = WHEELBASE_R2  # 轴距
@@ -338,9 +339,10 @@ class MSSDController:
             return False
         
         try:
-            # 如果速度不为零，先启动电机
+            # 如果速度不为零，先启动电机（仅在电机未启动时发送启动命令）
             if abs(speed_rpm) > 0:
-                self.start()
+                if not self._motor_started:
+                    self.start()
             else:
                 # 速度为零，停止电机
                 self.stop()
@@ -389,6 +391,7 @@ class MSSDController:
             
             if success:
                 self.cached_motor_speed = 0
+                self._motor_started = False
                 if self.debug:
                     print(f"[MSSD] 电机已停止 ({'减速' if decelerate else '立即'})")
             
@@ -413,6 +416,7 @@ class MSSDController:
             success = self._write_register(32, 1)  # 1 = 启动
             
             if success:
+                self._motor_started = True
                 if self.debug:
                     print("[MSSD] 电机已启动")
             
