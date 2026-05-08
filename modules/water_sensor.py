@@ -189,23 +189,14 @@ class WaterSensor:
 
         try:
             with self.relay._lock:
-                # 1. 读取并缓存设备配置（只在首次或缓存失效时读取）
+                # 1. 使用硬编码设备配置（寄存器易被串口干扰误读，导致4%↔100%跳变）
+                # 实测：raw=866, dp=1, uc=8(mmH2O) → 86.6mmH2O → 8.66cm → 4.02%
+                # 误读：dp=2, uc=7(mH2O) → 8.66mH2O → 866cm → 100%
                 if self._cached_decimal_point is None or self._cached_unit_code is None:
-                    dp = self._send_modbus_read(0x0003)
-                    uc = self._send_modbus_read(0x0002)
-                    if dp is not None and uc is not None:
-                        self._cached_decimal_point = dp
-                        self._cached_unit_code = uc
-                        if self.debug:
-                            print(f"[WaterSensor] 缓存设备配置: decimal_point={dp}, unit_code={uc}")
-                    else:
-                        self._config_read_attempts += 1
-                        if self._config_read_attempts > 10:
-                            # 多次失败后使用默认值
-                            self._cached_decimal_point = 1
-                            self._cached_unit_code = 1  # 默认 kPa
-                            if self.debug:
-                                print("[WaterSensor] 配置读取多次失败，使用默认值: dp=1, unit=kPa")
+                    self._cached_decimal_point = 1   # 1位小数
+                    self._cached_unit_code = 8       # mmH2O
+                    if self.debug:
+                        print(f"[WaterSensor] 使用硬编码配置: decimal_point=1, unit_code=8(mmH2O)")
 
                 decimal_point = self._cached_decimal_point if self._cached_decimal_point is not None else 1
                 unit_code = self._cached_unit_code if self._cached_unit_code is not None else 1
