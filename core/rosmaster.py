@@ -165,8 +165,8 @@ class Rosmaster:
         if self.is_r2_mssd:
             self.data_sync.start()
             
-            # 启动数据更新定时器（每10ms更新一次数据到同步器）
-            self._data_update_timer = threading.Timer(0.01, self._data_update_loop)
+            # 启动数据更新定时器（每30ms更新一次数据到同步器，避免Modbus堆积）
+            self._data_update_timer = threading.Timer(0.03, self._data_update_loop)
             self._data_update_timer.daemon = True
             self._data_update_timer.start()
             
@@ -187,7 +187,7 @@ class Rosmaster:
             self._check_state_maintenance()
             
             # 重新调度定时器
-            self._data_update_timer = threading.Timer(0.01, self._data_update_loop)
+            self._data_update_timer = threading.Timer(0.03, self._data_update_loop)
             self._data_update_timer.daemon = True
             self._data_update_timer.start()
     
@@ -443,18 +443,21 @@ class Rosmaster:
     def _update_data_sync(self):
         """
         更新数据同步器的数据（内部方法）
-        
+
         从STM32和MSSD读取最新数据，更新到DataSynchronizer
         """
         if not self.is_r2_mssd:
             return
-        
-        # 更新MSSD速度
+
+        # 更新MSSD速度和编码器
+        # 速度寄存器[9-10]不能单独读(成功率<10%)，必须通过批量读[7-23]获取
+        # 编码器[22-23]单独读取成功率95%，优于批量读的65%
         if self.mssd and self.mssd.connected:
-            speed_rpm = self.mssd.get_speed()
-            self.data_sync.update_mssd_speed(speed_rpm)
-            
-            # 更新MSSD编码器
+            # 速度：通过批量读[7-23]获取（唯一可靠方式）
+            status = self.mssd.get_status()
+            if 'speed' in status:
+                self.data_sync.update_mssd_speed(status['speed'])
+            # 编码器：单独读取[22-23]（成功率95%）
             encoder = self.mssd.get_encoder()
             self.data_sync.update_mssd_encoder(encoder)
         
@@ -558,11 +561,65 @@ class Rosmaster:
             # 原有逻辑（保持不变）
             m1, m2, m3, m4 = self.stm32.encoder_m1, self.stm32.encoder_m2, self.stm32.encoder_m3, self.stm32.encoder_m4
             return m1, m2, m3, m4
-    
+
+    def update_encoder_distance(self):
+        """
+        计算编码器里程增量（仅 R2_MSSD 模式）
+
+        从 DataSynchronizer 获取编码器累计值，计算增量并转换为米。
+
+        Returns:
+            (distance_delta, total_distance) - 本次距离增量(米), 累计总距离(米)
+
+        注意:
+            encoder_ticks_per_rev 需要标定。
+            当值为0或负数时返回 (0.0, total_distance)，不影响现有逻辑。
+            标定方法：手动推车走已知距离(如10m)，记录编码器变化，反算 ticks_per_rev。
+        """
+        # 默认值
+        zero = (0.0, getattr(self, '_encoder_total_distance', 0.0))
+
+        if not self.is_r2_mssd or not self.data_sync:
+            return zero
+
+        # MSSD编码器: 30脉冲 = 电机旋转1圈
+        ENCODER_TICKS_PER_REV = 30
+        # 物理参数
+        gear_ratio = MSSD_GEAR_RATIO     # 41
+        tire_diameter = TIRE_DIAMETER_R2  # 0.56m
+        # 每个脉冲对应的行驶距离(米)
+        meters_per_tick = (math.pi * tire_diameter) / (ENCODER_TICKS_PER_REV * gear_ratio)
+
+        # 获取当前编码器值
+        sync_data = self.data_sync.get_sync_data()
+        current_encoder = sync_data.get('encoder', 0)
+
+        # 首次调用，初始化
+        if not hasattr(self, '_encoder_last_value'):
+            self._encoder_last_value = current_encoder
+            self._encoder_total_distance = 0.0
+            return (0.0, 0.0)
+
+        # 跳过无效值（编码器为0且上次不为0，说明是缓存过期未被更新）
+        if current_encoder == 0 and self._encoder_last_value != 0:
+            return (0.0, self._encoder_total_distance)
+
+        # 计算增量
+        delta_ticks = current_encoder - self._encoder_last_value
+        self._encoder_last_value = current_encoder
+
+        # 脉冲增量 -> 米
+        distance_delta = delta_ticks * meters_per_tick
+
+        # 更新累计距离
+        self._encoder_total_distance += distance_delta
+
+        return (distance_delta, self._encoder_total_distance)
+
     def get_battery_voltage(self):
         """
         获取电池电压
-        
+
         Returns:
             电池电压（V）
         """

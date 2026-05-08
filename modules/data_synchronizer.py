@@ -186,12 +186,11 @@ class DataSynchronizer:
                 vz = 0.0
             self._sync_data['vz'] = vz
             
-            # 获取编码器
+            # 获取编码器（累计值，过期时不重置为0，保留上次有效值）
             mssd_encoder = self._data_cache['mssd_encoder']
             if mssd_encoder['valid'] and self._is_data_valid(mssd_encoder):
                 self._sync_data['encoder'] = mssd_encoder['value']
-            else:
-                self._sync_data['encoder'] = 0
+            # 过期时不覆盖，保留上次有效值（编码器是累计计数器，不是速率）
             
             # 获取IMU数据
             imu_yaw = self._data_cache['imu_yaw']

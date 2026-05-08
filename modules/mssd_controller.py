@@ -148,8 +148,8 @@ class MSSDController:
                 self.ser.write(frame)
                 self.ser.flush()
 
-                # 读取响应
-                time.sleep(0.01)
+                # 读取响应（等待MSSD处理时间）
+                time.sleep(0.025)
                 response = self.ser.read(5 + 2 * count)
 
                 if len(response) < 5:
@@ -429,13 +429,13 @@ class MSSDController:
     def get_speed(self):
         """
         获取电机实际速度
-        
+
         Returns:
-            实际速度（RPM），失败返回 0
+            实际速度（RPM），失败返回缓存值
         """
         if not self.connected:
-            return 0
-        
+            return getattr(self, 'speed', 0)
+
         try:
             # 读取速度寄存器（9-10）
             values = self._read_registers(9, 2)
@@ -443,24 +443,25 @@ class MSSDController:
                 speed_high = values[0]
                 speed_low = values[1]
                 speed = (speed_high << 16) | speed_low
-                
+
                 # 处理负数
                 if speed & 0x80000000:
                     speed = speed - 0x100000000
-                
+
                 self.speed = speed
                 self.last_update_time = time.time()
-                
+
                 # 转换为线速度
                 self.linear_velocity = (speed / 60.0 / self.gear_ratio) * math.pi * self.tire_diameter
-                
+
                 return speed
             else:
-                return 0
+                # 读取失败，返回缓存值
+                return getattr(self, 'speed', 0)
         except Exception as e:
             if self.debug:
                 print(f"[MSSD] 获取速度错误: {e}")
-            return 0
+            return getattr(self, 'speed', 0)
     
     def get_cached_speed(self):
         """
@@ -483,13 +484,13 @@ class MSSDController:
     def get_encoder(self):
         """
         获取编码器值
-        
+
         Returns:
-            编码器值，失败返回 0
+            编码器值，失败返回缓存值
         """
         if not self.connected:
-            return 0
-        
+            return getattr(self, '_last_encoder_value', 0)
+
         try:
             # 读取编码器寄存器（22-23）
             values = self._read_registers(22, 2)
@@ -497,18 +498,20 @@ class MSSDController:
                 encoder_high = values[0]
                 encoder_low = values[1]
                 encoder = (encoder_high << 16) | encoder_low
-                
+
                 # 处理负数
                 if encoder & 0x80000000:
                     encoder = encoder - 0x100000000
-                
+
+                self._last_encoder_value = encoder
                 return encoder
             else:
-                return 0
+                # 读取失败，返回缓存值
+                return getattr(self, '_last_encoder_value', 0)
         except Exception as e:
             if self.debug:
                 print(f"[MSSD] 获取编码器错误: {e}")
-            return 0
+            return getattr(self, '_last_encoder_value', 0)
     
     def get_status(self):
         """

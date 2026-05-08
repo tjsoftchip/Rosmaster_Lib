@@ -69,10 +69,13 @@ class BatteryMonitor:
                 crc = calculate_crc16(frame)
                 frame += bytes([crc & 0xFF, (crc >> 8) & 0xFF])
                 
+                # 刷新 RX 缓冲区，清除可能残留的其他设备响应数据
+                self.relay.ser.reset_input_buffer()
+
                 # 发送请求
                 self.relay.ser.write(frame)
                 self.relay.ser.flush()
-                
+
                 # 读取响应
                 time.sleep(0.02)
                 response = self.relay.ser.read(5 + count * 2)

@@ -154,6 +154,9 @@ class RelayController:
                 if self.debug:
                     print(f"[Relay] 发送: {frame.hex()} (coil_addr={coil_addr}, value={value})")
 
+                # 刷新 RX 缓冲区，清除可能残留的其他设备响应数据
+                self.ser.reset_input_buffer()
+
                 # 发送请求
                 self.ser.write(frame)
                 self.ser.flush()
@@ -211,6 +214,9 @@ class RelayController:
                 frame = bytes([self.device_id, 0x01]) + data
                 crc = calculate_crc16(frame)
                 frame += bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+
+                # 刷新 RX 缓冲区，清除可能残留的其他设备响应数据
+                self.ser.reset_input_buffer()
 
                 # 发送请求
                 self.ser.write(frame)
