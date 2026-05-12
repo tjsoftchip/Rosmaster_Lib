@@ -189,14 +189,14 @@ class WaterSensor:
 
         try:
             with self.relay._lock:
-                # 1. 使用硬编码设备配置（寄存器易被串口干扰误读，导致4%↔100%跳变）
-                # 实测：raw=866, dp=1, uc=8(mmH2O) → 86.6mmH2O → 8.66cm → 4.02%
-                # 误读：dp=2, uc=7(mH2O) → 8.66mH2O → 866cm → 100%
+                # 1. 使用正确的硬编码配置（基于实际传感器测试）
+                # 实测配置：decimal_point=2, unit_code=7 (mH2O)
+                # 这样可以避免串口干扰导致的配置误读，同时适配当前传感器
                 if self._cached_decimal_point is None or self._cached_unit_code is None:
-                    self._cached_decimal_point = 1   # 1位小数
-                    self._cached_unit_code = 8       # mmH2O
+                    self._cached_decimal_point = 2   # 2位小数
+                    self._cached_unit_code = 7       # mH2O
                     if self.debug:
-                        print(f"[WaterSensor] 使用硬编码配置: decimal_point=1, unit_code=8(mmH2O)")
+                        print(f"[WaterSensor] 使用修正配置: decimal_point=2, unit_code=7(mH2O)")
 
                 decimal_point = self._cached_decimal_point if self._cached_decimal_point is not None else 1
                 unit_code = self._cached_unit_code if self._cached_unit_code is not None else 1
